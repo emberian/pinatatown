@@ -79,6 +79,14 @@ export class ThreatSystem {
   // Night danger settings
   private nightDangerMultiplier: number = 2.0; // Raids twice as likely at night
 
+  // Escalation tracking
+  private raidsCompleted = 0;
+  private totalPredatorsKilled = 0;
+  private buildingCount = 0;
+
+  // Prosperity tracker (set by GameScene)
+  private prosperityChecker: (() => number) | null = null;
+
   constructor(
     scene: Phaser.Scene,
     isoMap: IsoMap,
@@ -104,6 +112,14 @@ export class ThreatSystem {
     this.colonySystem = colonySystem;
   }
 
+  setProsperityChecker(checker: () => number): void {
+    this.prosperityChecker = checker;
+  }
+
+  setBuildingCount(count: number): void {
+    this.buildingCount = count;
+  }
+
   private setupEventListeners(): void {
     // Remove predators from tracking when they die
     EventBus.on(GameEvents.PINATA_DIED, (...args: unknown[]) => {
@@ -111,10 +127,21 @@ export class ThreatSystem {
       const index = this.activePredators.indexOf(pinata);
       if (index !== -1) {
         this.activePredators.splice(index, 1);
+        this.totalPredatorsKilled++;
 
         // Colony fear decreases when predator is killed
         EventBus.emit('threat:predatorKilled', pinata);
+
+        // Check if raid ended (all predators killed)
+        if (this.activePredators.length === 0) {
+          EventBus.emit('threat:raidEnded', { survived: true, raidNumber: this.raidsCompleted });
+        }
       }
+    });
+
+    // Track buildings for escalation
+    EventBus.on(GameEvents.BUILDING_COMPLETE, () => {
+      this.buildingCount++;
     });
   }
 
@@ -135,16 +162,26 @@ export class ThreatSystem {
   }
 
   private updateThreatLevel(): void {
-    // Threat level scales with colony population and prosperity
+    // Threat level scales with colony population, buildings, and prosperity
     const population = this.pinatas.filter(p => p.getIsAlive() && !p.isPredator()).length;
 
-    if (population <= 2) {
+    // Calculate prosperity score
+    let prosperityScore = population;
+    prosperityScore += this.buildingCount * 2; // Buildings attract attention
+
+    // Add custom prosperity (coins/score) if tracked
+    if (this.prosperityChecker) {
+      prosperityScore += Math.floor(this.prosperityChecker() / 100);
+    }
+
+    // Determine base threat level from prosperity
+    if (population <= 2 || prosperityScore <= 3) {
       this.threatLevel = ThreatLevel.None; // Small colonies get grace period
-    } else if (population <= 5) {
+    } else if (prosperityScore <= 8) {
       this.threatLevel = ThreatLevel.Low;
-    } else if (population <= 8) {
+    } else if (prosperityScore <= 15) {
       this.threatLevel = ThreatLevel.Medium;
-    } else if (population <= 12) {
+    } else if (prosperityScore <= 25) {
       this.threatLevel = ThreatLevel.High;
     } else {
       this.threatLevel = ThreatLevel.Siege;
@@ -196,12 +233,15 @@ export class ThreatSystem {
 
     // Limit active predators (don't overwhelm)
     const existingPredators = this.activePredators.length;
-    const toSpawn = Math.min(targetCount, 3 - existingPredators);
+    const toSpawn = Math.min(targetCount, 4 - existingPredators);
 
     if (toSpawn <= 0) return;
 
-    console.log(`Raid incoming! Spawning ${toSpawn} ${config.species}(s)`);
-    EventBus.emit('threat:raidStarting', { count: toSpawn, species: config.species });
+    // Mark raid starting
+    this.raidsCompleted++; // Increment on start; raidEnded is emitted when all killed
+
+    console.log(`Raid #${this.raidsCompleted} incoming! Spawning ${toSpawn} ${config.species}(s)`);
+    EventBus.emit('threat:raidStarting', { count: toSpawn, species: config.species, raidNumber: this.raidsCompleted });
 
     for (let i = 0; i < toSpawn; i++) {
       this.spawnPredator(config.species);

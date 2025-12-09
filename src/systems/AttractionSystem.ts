@@ -7,6 +7,8 @@ import { IsoMap } from '../world/IsoMap';
 import { TerrainType, WORLD_WIDTH, WORLD_HEIGHT } from '../utils/Constants';
 import { Pathfinder } from '../world/Pathfinding';
 import { EventBus, GameEvents } from '../utils/EventBus';
+import type { BuildingSystem } from './BuildingSystem';
+import { FarmingSystem, CROP_DATA } from './FarmingSystem';
 
 export interface AttractionRequirements {
   grassTiles?: number;
@@ -72,6 +74,10 @@ export class AttractionSystem {
   private pathfinder: Pathfinder;
   private pinatas: Pinata[];
 
+  // Optional system references for bonus calculations
+  private buildingSystem: BuildingSystem | null = null;
+  private farmingSystem: FarmingSystem | null = null;
+
   private checkTimer = 0;
   private readonly CHECK_INTERVAL = 15000; // Check every 15 seconds
 
@@ -99,6 +105,14 @@ export class AttractionSystem {
 
     // Initial terrain count
     this.updateTerrainCounts();
+  }
+
+  setBuildingSystem(buildingSystem: BuildingSystem): void {
+    this.buildingSystem = buildingSystem;
+  }
+
+  setFarmingSystem(farmingSystem: FarmingSystem): void {
+    this.farmingSystem = farmingSystem;
   }
 
   update(delta: number): void {
@@ -253,8 +267,33 @@ export class AttractionSystem {
 
       // Check requirements
       if (this.meetsRequirements(species)) {
-        this.attractPinata(species);
-        return; // Only attract one per check
+        // Calculate attraction chance modifier from bonuses
+        let attractionChance = 1.0;
+
+        // Check building bonuses (HoneyPot, etc.)
+        if (this.buildingSystem) {
+          for (const building of this.buildingSystem.getCompletedBuildings()) {
+            if (building.data.effect.attractionBonus === species) {
+              attractionChance += 0.5; // +50% per matching building
+            }
+          }
+        }
+
+        // Check crop attraction bonuses
+        if (this.farmingSystem) {
+          for (const crop of this.farmingSystem.getAllCrops()) {
+            const cropData = CROP_DATA[crop.type];
+            if (cropData.attractsSpecies === species) {
+              attractionChance += 0.25; // +25% per matching crop
+            }
+          }
+        }
+
+        // Roll for attraction with bonuses
+        if (Math.random() < attractionChance) {
+          this.attractPinata(species);
+          return; // Only attract one per check
+        }
       }
     }
   }

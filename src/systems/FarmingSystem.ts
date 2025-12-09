@@ -131,6 +131,7 @@ export interface PlantedCrop {
   needsWater: boolean;
   waterLevel: number;          // 0-100
   sprite: Phaser.GameObjects.Container;
+  waterIndicator?: Phaser.GameObjects.Text; // Track water indicator to avoid leaks
 }
 
 export const FarmingEvents = {
@@ -142,11 +143,15 @@ export const FarmingEvents = {
 
 let cropIdCounter = 0;
 
+// Import BuildingSystem type for water well check
+import type { BuildingSystem } from './BuildingSystem';
+
 export class FarmingSystem {
   private scene: Phaser.Scene;
   private zoneManager: ZoneManager;
   private resourceManager: ResourceManager;
   private seasonSystem: SeasonSystem | null = null;
+  private buildingSystem: BuildingSystem | null = null;
   private isoMap: IsoMap;
 
   private crops: Map<number, PlantedCrop> = new Map();
@@ -172,6 +177,10 @@ export class FarmingSystem {
 
   setSeasonSystem(seasonSystem: SeasonSystem): void {
     this.seasonSystem = seasonSystem;
+  }
+
+  setBuildingSystem(buildingSystem: BuildingSystem): void {
+    this.buildingSystem = buildingSystem;
   }
 
   update(delta: number): void {
@@ -317,6 +326,7 @@ export class FarmingSystem {
   }
 
   private hasWaterNearby(position: GridPosition): boolean {
+    // Check for natural water tiles
     const range = 3;
     for (let dx = -range; dx <= range; dx++) {
       for (let dy = -range; dy <= range; dy++) {
@@ -326,6 +336,12 @@ export class FarmingSystem {
         }
       }
     }
+
+    // Also check for Water Well building
+    if (this.buildingSystem?.hasWaterNearby(position)) {
+      return true;
+    }
+
     return false;
   }
 
@@ -390,6 +406,11 @@ export class FarmingSystem {
   }
 
   private removeCrop(crop: PlantedCrop): void {
+    // Clean up water indicator if exists
+    if (crop.waterIndicator) {
+      this.scene.tweens.killTweensOf(crop.waterIndicator);
+      crop.waterIndicator.destroy();
+    }
     crop.sprite.destroy();
     this.crops.delete(crop.id);
     this.cropsByPosition.delete(this.posKey(crop.position));
@@ -480,11 +501,18 @@ export class FarmingSystem {
         break;
     }
 
-    // Water indicator
-    if (crop.needsWater) {
+    // Water indicator - clean up existing before creating new
+    if (crop.waterIndicator) {
+      this.scene.tweens.killTweensOf(crop.waterIndicator);
+      crop.waterIndicator.destroy();
+      crop.waterIndicator = undefined;
+    }
+
+    if (crop.needsWater && crop.stage !== CropStage.Withered) {
       const waterText = this.scene.add.text(8, -12, '💧', { fontSize: '10px' });
       waterText.setOrigin(0, 0.5);
       crop.sprite.add(waterText);
+      crop.waterIndicator = waterText;
 
       // Pulse animation
       this.scene.tweens.add({

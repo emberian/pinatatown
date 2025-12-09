@@ -182,6 +182,11 @@ export class Resource extends Phaser.GameObjects.Container {
   }
 }
 
+// Import BuildingSystem type for storage bonus
+import type { BuildingSystem } from '../systems/BuildingSystem';
+
+const BASE_STORAGE_CAP = 50; // Base maximum resources in stockpile
+
 /**
  * Manages all resources in the game
  */
@@ -192,6 +197,9 @@ export class ResourceManager {
 
   // Zone manager reference for finding stockpile positions
   private zoneManager: ZoneManager | null = null;
+
+  // Building system reference for storage bonus from Granary
+  private buildingSystem: BuildingSystem | null = null;
 
   // Track resources at each stockpile tile position
   // Key is "x,y", value is array of resources at that position
@@ -208,6 +216,27 @@ export class ResourceManager {
 
   setZoneManager(zoneManager: ZoneManager): void {
     this.zoneManager = zoneManager;
+  }
+
+  setBuildingSystem(buildingSystem: BuildingSystem): void {
+    this.buildingSystem = buildingSystem;
+  }
+
+  getStorageCap(): number {
+    const bonus = this.buildingSystem?.getTotalStorageBonus() ?? 0;
+    return BASE_STORAGE_CAP + bonus;
+  }
+
+  getTotalStored(): number {
+    let total = 0;
+    for (const count of this.stockpileResources.values()) {
+      total += count;
+    }
+    return total;
+  }
+
+  isStorageFull(): boolean {
+    return this.getTotalStored() >= this.getStorageCap();
   }
 
   spawnResource(gridX: number, gridY: number, type: ResourceType): Resource {
@@ -266,7 +295,13 @@ export class ResourceManager {
   }
 
   // Add to stockpile - resource moves to a visible pile in a stockpile zone
-  addToStockpile(resource: Resource): void {
+  // Returns false if storage is full
+  addToStockpile(resource: Resource): boolean {
+    // Check storage cap
+    if (this.isStorageFull()) {
+      return false; // Storage full - can't add more
+    }
+
     const type = resource.resourceType;
     const current = this.stockpileResources.get(type) ?? 0;
     this.stockpileResources.set(type, current + 1);
@@ -281,6 +316,7 @@ export class ResourceManager {
       // No stockpile zone available - hide as fallback
       resource.storeInStockpile();
     }
+    return true;
   }
 
   /**

@@ -591,6 +591,10 @@ export class Pinata extends Phaser.GameObjects.Container {
         this.executeSeekCompanionGoal(delta, goal);
         break;
 
+      case GoalType.Romance:
+        this.executeRomanceGoal(delta, goal);
+        break;
+
       case GoalType.AvoidRival:
         this.executeAvoidRivalGoal(delta, goal);
         break;
@@ -719,8 +723,25 @@ export class Pinata extends Phaser.GameObjects.Container {
   }
 
   private updateMood(): void {
-    const avgNeed = (this.needs.hunger + this.needs.rest + this.needs.fun + this.needs.social) / 4;
-    const minNeed = Math.min(this.needs.hunger, this.needs.rest, this.needs.fun, this.needs.social);
+    let avgNeed = (this.needs.hunger + this.needs.rest + this.needs.fun + this.needs.social) / 4;
+    let minNeed = Math.min(this.needs.hunger, this.needs.rest, this.needs.fun, this.needs.social);
+
+    // Apply Shrine mood bonus (raises effective average)
+    if (this.buildingSystem) {
+      const effects = this.buildingSystem.getEffectsAt({ x: this.gridX, y: this.gridY });
+      if (effects.moodBonus) {
+        avgNeed = Math.min(NEED_MAX, avgNeed + effects.moodBonus);
+        minNeed = Math.min(NEED_MAX, minNeed + effects.moodBonus * 0.5); // Half effect on min
+      }
+    }
+
+    // Apply social mood modifier (friends nearby boost mood, rivals hurt it)
+    if (this.relationshipSystem) {
+      const socialModifier = this.relationshipSystem.getSocialMoodModifier(this.id);
+      avgNeed = Math.max(0, Math.min(NEED_MAX, avgNeed + socialModifier));
+      // Social modifiers have reduced effect on minimum need (can't prevent mental breaks alone)
+      minNeed = Math.max(0, Math.min(NEED_MAX, minNeed + socialModifier * 0.3));
+    }
 
     let newMood: MoodState;
 
@@ -831,6 +852,10 @@ export class Pinata extends Phaser.GameObjects.Container {
 
       case BehaviorState.Building:
         this.handleBuildingWork(delta);
+        break;
+
+      case BehaviorState.Guarding:
+        this.handleGuarding(delta);
         break;
 
       default:
@@ -1214,8 +1239,18 @@ export class Pinata extends Phaser.GameObjects.Container {
       return;
     }
 
-    // Farming takes 2 seconds per action
-    if (this.activityTimer >= 2000) {
+    // Calculate work speed with trait and building bonuses
+    let workSpeed = this.traitEffects.workSpeedMult ?? 1.0;
+    if (this.buildingSystem) {
+      const effects = this.buildingSystem.getEffectsAt({ x: this.gridX, y: this.gridY });
+      if (effects.workSpeedBonus) {
+        workSpeed *= effects.workSpeedBonus;
+      }
+    }
+
+    // Farming takes 2 seconds per action (modified by work speed)
+    const farmTime = 2000 / workSpeed;
+    if (this.activityTimer >= farmTime) {
       this.activityTimer = 0;
 
       if (taskData.action === 'harvest' && crop.stage === CropStage.Mature) {
@@ -1251,8 +1286,12 @@ export class Pinata extends Phaser.GameObjects.Container {
     if (this.activityTimer >= 1000) {
       this.activityTimer = 0;
 
-      // Work speed affected by traits
-      const workSpeed = this.traitEffects.workSpeedMult ?? 1.0;
+      // Work speed affected by traits AND nearby workshop
+      let workSpeed = this.traitEffects.workSpeedMult ?? 1.0;
+      const effects = this.buildingSystem.getEffectsAt({ x: this.gridX, y: this.gridY });
+      if (effects.workSpeedBonus) {
+        workSpeed *= effects.workSpeedBonus;
+      }
       this.buildingSystem.workOnBuilding(building, workSpeed);
 
       // Building work is tiring
@@ -1285,8 +1324,14 @@ export class Pinata extends Phaser.GameObjects.Container {
       return;
     }
 
-    // Find nearby predators
-    const threatRange = 8; // tiles
+    // Find nearby predators - base range extended by Watchtower
+    let threatRange = 8; // tiles
+    if (this.buildingSystem) {
+      const effects = this.buildingSystem.getEffectsAt({ x: this.gridX, y: this.gridY });
+      if (effects.sightRange) {
+        threatRange += effects.sightRange;
+      }
+    }
     for (const other of this.allPinatas) {
       if (!other.isPredator() || !other.isAlive) continue;
 
@@ -1478,6 +1523,47 @@ export class Pinata extends Phaser.GameObjects.Container {
       this.behavior = BehaviorState.Idle;
       this.idleTimer = 0;
       this.threat = null;
+    }
+  }
+
+  private handleGuarding(delta: number): void {
+    this.activityTimer += delta;
+
+    // While guarding, watch for threats
+    for (const other of this.allPinatas) {
+      if (other === this || !other.getIsAlive()) continue;
+      if (!other.isPredator()) continue;
+
+      const dist = this.distanceTo(other);
+      if (dist < 8) {
+        // Predator spotted! Engage
+        this.threat = other;
+        this.behavior = BehaviorState.Fighting;
+        this.activityTimer = 0;
+        console.log(`${this.nickname} spots predator ${other.nickname} while guarding!`);
+        return;
+      }
+    }
+
+    // Continue movement if we have a path (patrol within guard area)
+    if (this.currentPath.length > 0) {
+      this.updateMovement(delta);
+    }
+
+    // Guard animation - occasional vigilant look around
+    if (this.activityTimer > 3000) {
+      this.activityTimer = 0;
+      // Visual feedback - alert icon
+      const alert = this.scene.add.text(this.x, this.y - 35, '👀', { fontSize: '12px' });
+      alert.setOrigin(0.5);
+      alert.setDepth(2000);
+      this.scene.tweens.add({
+        targets: alert,
+        y: alert.y - 10,
+        alpha: 0,
+        duration: 1000,
+        onComplete: () => alert.destroy(),
+      });
     }
   }
 
@@ -2330,6 +2416,87 @@ export class Pinata extends Phaser.GameObjects.Container {
     }
   }
 
+  private executeRomanceGoal(delta: number, goal: Goal): void {
+    // Find romantic interest - either specified target or search for compatible partner
+    let target: Pinata | null = null;
+
+    if (goal.targetEntityId !== undefined) {
+      target = this.allPinatas.find(p => p.id === goal.targetEntityId) ?? null;
+    }
+
+    // If no target specified, find a compatible partner
+    if (!target) {
+      target = this.findRomanticPartner();
+    }
+
+    if (!target || !target.getIsAlive()) {
+      this.goalQueue.failActive();
+      return;
+    }
+
+    // Check if we can even romance (needs must be met)
+    const needs = this.needs;
+    if (needs.hunger < 50 || needs.rest < 50 || needs.fun < 50 || needs.social < 50) {
+      // Needs not met, fail the goal
+      this.goalQueue.failActive();
+      return;
+    }
+
+    const dist = this.distanceTo(target);
+
+    if (dist <= 3) {
+      // Close enough - the RomanceSystem will detect proximity and handle courtship
+      // Just stay near them and socialize
+      this.socialTarget = target;
+      this.behavior = BehaviorState.Socializing;
+      this.activityTimer = 0;
+
+      // Build affection through socializing
+      this.handleSocializing(delta);
+
+      // After some time near them, consider goal complete (RomanceSystem handles actual breeding)
+      goal.progress = (goal.progress ?? 0) + delta;
+      if ((goal.progress ?? 0) >= 8000) {
+        // Spent enough time together
+        this.goalQueue.completeActive();
+      }
+    } else {
+      // Move toward romantic interest
+      if (this.currentPath.length === 0) {
+        const targetPos = target.getGridPosition();
+        this.moveToGrid(targetPos.x, targetPos.y);
+      }
+      this.updateMovement(delta);
+    }
+  }
+
+  private findRomanticPartner(): Pinata | null {
+    // Find same-species piñata with high affection
+    let bestMatch: Pinata | null = null;
+    let bestAffection = 50; // Minimum threshold
+
+    for (const other of this.allPinatas) {
+      if (other === this || !other.getIsAlive()) continue;
+      if (other.species !== this.species) continue;
+      if (other.isPredator()) continue;
+
+      // Check affection via relationship system
+      if (this.relationshipSystem) {
+        const affection = this.relationshipSystem.getAffection(this.id, other.id);
+        if (affection > bestAffection) {
+          // Check if they're in a good mood too
+          const otherMood = other.getMood();
+          if (otherMood === MoodState.Happy || otherMood === MoodState.Content) {
+            bestMatch = other;
+            bestAffection = affection;
+          }
+        }
+      }
+    }
+
+    return bestMatch;
+  }
+
   private executeAvoidRivalGoal(delta: number, goal: Goal): void {
     const rival = this.allPinatas.find(p => p.id === goal.targetEntityId);
 
@@ -2468,13 +2635,8 @@ export class Pinata extends Phaser.GameObjects.Container {
         break;
 
       case GoalType.MentalBreakFire:
-        // TODO: Implement fire starting when we have fire system
-        // For now, just wander angrily
-        if (this.currentPath.length === 0) {
-          this.startWandering();
-        }
-        this.updateMovement(delta);
-        console.log(`${this.nickname} is looking for something to burn...`);
+        // Pyromaniac seeks out crops or buildings to destroy
+        this.executePyromaniacBehavior(delta, goal);
         break;
     }
 
@@ -2484,6 +2646,99 @@ export class Pinata extends Phaser.GameObjects.Container {
     if (avgNeed > 50 && minNeed > 30) {
       this.mood = MoodState.Stressed;
       this.goalQueue.completeActive();
+    }
+  }
+
+  private executePyromaniacBehavior(delta: number, goal: Goal): void {
+    // Track destruction count
+    const destroyed = (goal.data?.destroyed as number) ?? 0;
+    const maxDestruction = 3; // Destroy up to 3 things before calming down
+
+    if (destroyed >= maxDestruction) {
+      // Enough destruction, start to calm down
+      console.log(`${this.nickname} feels better after some arson...`);
+      this.needs.fun = Math.min(100, this.needs.fun + 40);
+      this.goalQueue.completeActive();
+      return;
+    }
+
+    // Find nearest crop to destroy
+    if (this.farmingSystem) {
+      const crops = this.farmingSystem.getAllCrops();
+      let nearestCrop = null;
+      let nearestDist = Infinity;
+
+      for (const crop of crops) {
+        const dist = Math.sqrt(
+          Math.pow(this.gridX - crop.position.x, 2) +
+          Math.pow(this.gridY - crop.position.y, 2)
+        );
+        if (dist < nearestDist) {
+          nearestDist = dist;
+          nearestCrop = crop;
+        }
+      }
+
+      if (nearestCrop) {
+        if (nearestDist <= 1.5) {
+          // Close enough to destroy!
+          this.createFireEffect(nearestCrop.position.x, nearestCrop.position.y);
+          this.farmingSystem.harvest(nearestCrop.id); // "Harvest" destroys the crop
+          goal.data = { ...goal.data, destroyed: destroyed + 1 };
+          console.log(`${this.nickname} set fire to a ${nearestCrop.type}! 🔥`);
+
+          // Gain some twisted satisfaction
+          this.needs.fun = Math.min(100, this.needs.fun + 15);
+        } else {
+          // Move toward crop
+          if (this.currentPath.length === 0) {
+            this.moveToGrid(nearestCrop.position.x, nearestCrop.position.y);
+          }
+          this.updateMovement(delta);
+        }
+        return;
+      }
+    }
+
+    // No crops found, wander angrily and create fire effects randomly
+    if (this.currentPath.length === 0) {
+      this.startWandering();
+    }
+    this.updateMovement(delta);
+
+    // Occasionally create fire effect while wandering
+    if (Math.random() < 0.02) {
+      this.createFireEffect(this.gridX, this.gridY);
+      goal.data = { ...goal.data, destroyed: destroyed + 0.5 };
+    }
+  }
+
+  private createFireEffect(gridX: number, gridY: number): void {
+    const screenPos = gridToScreen(gridX, gridY);
+
+    // Create fire emoji animation
+    const fireEmojis = ['🔥', '🔥', '💥', '✨'];
+    for (let i = 0; i < 5; i++) {
+      const emoji = fireEmojis[Math.floor(Math.random() * fireEmojis.length)];
+      const fire = this.scene.add.text(
+        screenPos.x + (Math.random() - 0.5) * 30,
+        screenPos.y - 10,
+        emoji,
+        { fontSize: `${14 + Math.random() * 10}px` }
+      );
+      fire.setOrigin(0.5);
+      fire.setDepth(2000);
+
+      this.scene.tweens.add({
+        targets: fire,
+        y: fire.y - 40 - Math.random() * 20,
+        alpha: 0,
+        scale: 0.3,
+        duration: 800 + Math.random() * 400,
+        delay: i * 100,
+        ease: 'Power2',
+        onComplete: () => fire.destroy(),
+      });
     }
   }
 

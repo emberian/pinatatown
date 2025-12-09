@@ -31,6 +31,7 @@ import { PerceptionSystem } from '../systems/PerceptionSystem';
 import { ColonySystem, ColonyMood } from '../systems/ColonySystem';
 import { ResourceNodeSystem } from '../systems/ResourceNodeSystem';
 import { ThreatSystem, ThreatLevel } from '../systems/ThreatSystem';
+import { ChallengeSystem, ChallengeEvents } from '../systems/ChallengeSystem';
 
 /**
  * Main game scene - handles world rendering and camera controls
@@ -55,7 +56,12 @@ export class GameScene extends Phaser.Scene {
   private colonySystem!: ColonySystem;
   private resourceNodeSystem!: ResourceNodeSystem;
   private threatSystem!: ThreatSystem;
+  private challengeSystem!: ChallengeSystem;
   private gameUI!: GameUI;
+
+  // Game state
+  private isGameOver = false;
+  private isVictory = false;
 
   private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
   private wasd!: { W: Phaser.Input.Keyboard.Key; A: Phaser.Input.Keyboard.Key; S: Phaser.Input.Keyboard.Key; D: Phaser.Input.Keyboard.Key };
@@ -101,8 +107,13 @@ export class GameScene extends Phaser.Scene {
     // Create the isometric map
     this.isoMap = new IsoMap(this);
 
-    // Create pathfinder
-    this.pathfinder = new Pathfinder((x, y) => this.isoMap.isWalkable(x, y));
+    // Create pathfinder - checks terrain AND building blocking (fences)
+    this.pathfinder = new Pathfinder((x, y) => {
+      if (!this.isoMap.isWalkable(x, y)) return false;
+      // Also check if blocked by fence/building (buildingSystem may not exist yet during init)
+      if (this.buildingSystem?.isBlocked(x, y)) return false;
+      return true;
+    });
 
     // Create zone manager
     this.zoneManager = new ZoneManager(this);
@@ -235,6 +246,12 @@ export class GameScene extends Phaser.Scene {
       this.isoMap
     );
 
+    // Connect resource manager to building system for storage cap (Granary bonus)
+    this.resourceManager.setBuildingSystem(this.buildingSystem);
+
+    // Connect farming system to building system for WaterWell
+    this.farmingSystem.setBuildingSystem(this.buildingSystem);
+
     // Create notification system (player feedback)
     this.notificationSystem = new NotificationSystem(this);
 
@@ -246,6 +263,10 @@ export class GameScene extends Phaser.Scene {
     this.workSystem.setFarmingSystem(this.farmingSystem);
     this.workSystem.setBuildingSystem(this.buildingSystem);
     // Note: resourceNodeSystem set after it's created below
+
+    // Connect attraction system to building and farming for bonuses (HoneyPot, crops)
+    this.attractionSystem.setBuildingSystem(this.buildingSystem);
+    this.attractionSystem.setFarmingSystem(this.farmingSystem);
 
     // Create perception system (allows piñatas to notice events)
     this.perceptionSystem = new PerceptionSystem();
@@ -274,6 +295,19 @@ export class GameScene extends Phaser.Scene {
     this.threatSystem.setPinatas(this.pinatas);
     this.threatSystem.setTimeSystem(this.timeSystem);
     this.threatSystem.setColonySystem(this.colonySystem);
+    // Wire up prosperity tracking for threat escalation
+    this.threatSystem.setProsperityChecker(() => this.gameUI.getCoins());
+
+    // Create challenge system (goals and progression)
+    this.challengeSystem = new ChallengeSystem();
+    this.setupChallengeEvents();
+
+    // Wire up building system with unlocks and coins
+    this.buildingSystem.setUnlockChecker((type) => this.challengeSystem.isUnlocked(type));
+    this.buildingSystem.setCoinHandlers(
+      () => this.gameUI.getCoins(),
+      (amount) => this.gameUI.spendCoins(amount)
+    );
 
     // Connect piñatas to all systems
     for (const pinata of this.pinatas) {
@@ -289,14 +323,17 @@ export class GameScene extends Phaser.Scene {
 
     // Welcome notifications
     this.notificationSystem.special('Welcome to Piñata Town!', '🎉');
-    this.time.delayedCall(2500, () => {
-      this.notificationSystem.info('[F]eed and [P]et piñatas to earn coins!', '💰');
+    this.time.delayedCall(2000, () => {
+      this.notificationSystem.info('Complete challenges to unlock buildings!', '🎯');
+    });
+    this.time.delayedCall(4000, () => {
+      this.notificationSystem.info('Beware: raids scale with prosperity!', '⚠️');
     });
 
     console.log('Piñata Town loaded!');
     console.log('Controls: [Z]ones [B]uild [T]erraform [C]ommand [F]eed [P]et | [L] Log | [Space] Pause');
     console.log('Scroll wheel to zoom, right-click drag to pan.');
-    console.log('Seasons cycle every 3 minutes. Prepare for winter!');
+    console.log('Goal: Complete all challenges and survive! Buildings cost coins now.');
   }
 
   private createStartingZones(): void {
@@ -609,6 +646,11 @@ export class GameScene extends Phaser.Scene {
     // Connect newly created piñatas to all systems
     EventBus.on(GameEvents.PINATA_CREATED, (...args: unknown[]) => {
       const pinata = args[0] as Pinata;
+      // Core systems (must be set first)
+      pinata.setPathfinder(this.pathfinder);
+      pinata.setZoneManager(this.zoneManager);
+      pinata.setResourceManager(this.resourceManager);
+      // Game systems
       pinata.setTimeSystem(this.timeSystem);
       pinata.setRelationshipSystem(this.relationshipSystem);
       pinata.setSeasonSystem(this.seasonSystem);
@@ -652,6 +694,22 @@ export class GameScene extends Phaser.Scene {
     EventBus.on(GameEvents.COLONY_STARVATION, (...args: unknown[]) => {
       const pinata = args[0] as Pinata;
       this.notificationSystem.warning(`${pinata.nickname} is starving!`, '💀');
+    });
+
+    // Clean up dead piñatas from the list after they're destroyed
+    EventBus.on(GameEvents.PINATA_DIED, (...args: unknown[]) => {
+      const deadPinata = args[0] as Pinata;
+      // Delay removal to allow death animation to complete
+      this.time.delayedCall(4500, () => {
+        const idx = this.pinatas.indexOf(deadPinata);
+        if (idx !== -1) {
+          this.pinatas.splice(idx, 1);
+        }
+        // Deselect if this was the selected piñata
+        if (this.selectedPinata === deadPinata) {
+          this.deselectPinata();
+        }
+      });
     });
 
     // Resource node harvesting
@@ -898,6 +956,9 @@ export class GameScene extends Phaser.Scene {
       // Update threat system (predator raids)
       this.threatSystem.update(delta);
 
+      // Update challenge system (checks for goal completion)
+      this.updateChallenges();
+
       // Periodically spawn new resources (affected by season)
       this.resourceSpawnTimer += delta;
       const spawnInterval = this.RESOURCE_SPAWN_INTERVAL / this.seasonSystem.getResourceSpawnMultiplier();
@@ -941,8 +1002,10 @@ export class GameScene extends Phaser.Scene {
     }
 
     if (totalHappiness > 0) {
-      const coins = Math.floor(totalHappiness);
-      const score = Math.floor(totalHappiness * 2);
+      // Apply bonus multiplier from completed challenges
+      const multiplier = this.challengeSystem.getBonusMultiplier();
+      const coins = Math.floor(totalHappiness * multiplier);
+      const score = Math.floor(totalHappiness * 2 * multiplier);
       this.gameUI.addCoins(coins);
       this.gameUI.addScore(score);
 
@@ -1069,7 +1132,12 @@ export class GameScene extends Phaser.Scene {
       colonyState.fearLevel > 10
         ? `Fear: ${Math.round(colonyState.fearLevel)}%`
         : '',
+      ``,
+      `Challenges: ${this.challengeSystem.getCompletionPercent()}%`,
+      `Title: ${this.challengeSystem.getCurrentTitle()}`,
       this.isPaused ? '[PAUSED]' : '',
+      this.isGameOver ? '[GAME OVER]' : '',
+      this.isVictory ? '[VICTORY!]' : '',
     ];
 
     this.debugText.setText(lines.filter(l => l).join('\n'));
@@ -1115,6 +1183,85 @@ export class GameScene extends Phaser.Scene {
     }
 
     this.infoPanelText.setText(lines.join('\n'));
+  }
+
+  private setupChallengeEvents(): void {
+    // Challenge completion rewards
+    EventBus.on(ChallengeEvents.CHALLENGE_COMPLETED, (...args: unknown[]) => {
+      const challenge = args[0] as { name: string; reward: { coins?: number }; icon: string };
+      this.notificationSystem.special(`Challenge complete: ${challenge.name}!`, challenge.icon);
+
+      // Award coins
+      if (challenge.reward.coins) {
+        this.gameUI.addCoins(challenge.reward.coins);
+        this.time.delayedCall(500, () => {
+          this.notificationSystem.info(`+${challenge.reward.coins} coins!`, '💰');
+        });
+      }
+    });
+
+    // Notify when challenges unlock
+    EventBus.on(ChallengeEvents.CHALLENGE_UNLOCKED, (...args: unknown[]) => {
+      const challenge = args[0] as { name: string; icon: string };
+      this.notificationSystem.info(`New challenge available: ${challenge.name}`, challenge.icon);
+    });
+
+    // Game over
+    EventBus.on(ChallengeEvents.GAME_LOST, (...args: unknown[]) => {
+      const data = args[0] as { challengesCompleted: number; totalChallenges: number };
+      this.isGameOver = true;
+      this.isPaused = true;
+      this.notificationSystem.warning('GAME OVER - All piñatas have perished!', '💀');
+      this.time.delayedCall(1000, () => {
+        this.notificationSystem.info(
+          `You completed ${data.challengesCompleted}/${data.totalChallenges} challenges.`,
+          '📊'
+        );
+      });
+    });
+
+    // Victory
+    EventBus.on(ChallengeEvents.GAME_WON, (...args: unknown[]) => {
+      const data = args[0] as { title: string };
+      this.isVictory = true;
+      this.notificationSystem.special('VICTORY! All challenges completed!', '🏆');
+      this.time.delayedCall(1000, () => {
+        this.notificationSystem.special(`You've earned the title: ${data.title}!`, '👑');
+      });
+    });
+  }
+
+  private updateChallenges(): void {
+    if (this.isGameOver || this.isVictory) return;
+
+    // Gather current game state for challenge tracking
+    const alivePinatas = this.pinatas.filter(p => p.getIsAlive() && !p.isPredator());
+    const population = alivePinatas.length;
+
+    // Track species diversity
+    const speciesSeen = new Set<PinataSpecies>();
+    for (const pinata of alivePinatas) {
+      speciesSeen.add(pinata.species);
+    }
+
+    // Check if all piñatas are happy
+    const allHappy = population > 0 && alivePinatas.every(
+      p => p.getMood() === MoodState.Happy || p.getMood() === MoodState.Content
+    );
+
+    // Get current coins and stockpile
+    const coins = this.gameUI.getCoins();
+    const stockpile = this.resourceManager.getTotalStored();
+
+    // Update challenge system
+    this.challengeSystem.update(
+      population,
+      speciesSeen,
+      coins,
+      stockpile,
+      allHappy,
+      this.seasonSystem.getSeason()
+    );
   }
 
   getMap(): IsoMap {

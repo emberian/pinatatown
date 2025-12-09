@@ -27,6 +27,7 @@ export interface BuildingData {
   description: string;
   icon: string;
   cost: { type: ResourceType; amount: number }[];
+  coinCost: number;                // Candy coins required
   buildTime: number;               // Time to construct in ms
   size: { width: number; height: number };  // In tiles
   effect: BuildingEffect;
@@ -55,6 +56,7 @@ export const BUILDING_DATA: Record<BuildingType, BuildingData> = {
     cost: [
       { type: ResourceType.Berry, amount: 15 },
     ],
+    coinCost: 30,
     buildTime: 20000,
     size: { width: 2, height: 2 },
     effect: { restBonus: 1.5, effectRadius: 5 },
@@ -69,6 +71,7 @@ export const BUILDING_DATA: Record<BuildingType, BuildingData> = {
       { type: ResourceType.Berry, amount: 10 },
       { type: ResourceType.Seed, amount: 5 },
     ],
+    coinCost: 40,
     buildTime: 25000,
     size: { width: 1, height: 1 },
     effect: { sightRange: 8, effectRadius: 10 },
@@ -83,6 +86,7 @@ export const BUILDING_DATA: Record<BuildingType, BuildingData> = {
       { type: ResourceType.Berry, amount: 20 },
       { type: ResourceType.Seed, amount: 10 },
     ],
+    coinCost: 60,
     buildTime: 30000,
     size: { width: 2, height: 2 },
     effect: { storageBonus: 50 },
@@ -96,6 +100,7 @@ export const BUILDING_DATA: Record<BuildingType, BuildingData> = {
     cost: [
       { type: ResourceType.Berry, amount: 12 },
     ],
+    coinCost: 25,
     buildTime: 15000,
     size: { width: 2, height: 1 },
     effect: { funBonus: 1.75, effectRadius: 6 },
@@ -109,6 +114,7 @@ export const BUILDING_DATA: Record<BuildingType, BuildingData> = {
     cost: [
       { type: ResourceType.Seed, amount: 3 },
     ],
+    coinCost: 5,
     buildTime: 5000,
     size: { width: 1, height: 1 },
     effect: { blockMovement: true },
@@ -123,6 +129,7 @@ export const BUILDING_DATA: Record<BuildingType, BuildingData> = {
       { type: ResourceType.Berry, amount: 8 },
       { type: ResourceType.Seed, amount: 4 },
     ],
+    coinCost: 20,
     buildTime: 18000,
     size: { width: 1, height: 1 },
     effect: { waterRadius: 5 },
@@ -137,6 +144,7 @@ export const BUILDING_DATA: Record<BuildingType, BuildingData> = {
       { type: ResourceType.Berry, amount: 25 },
       { type: ResourceType.Honey, amount: 5 },
     ],
+    coinCost: 100,
     buildTime: 40000,
     size: { width: 2, height: 2 },
     effect: { moodBonus: 10, effectRadius: 100 }, // Colony-wide
@@ -150,6 +158,7 @@ export const BUILDING_DATA: Record<BuildingType, BuildingData> = {
     cost: [
       { type: ResourceType.Honey, amount: 3 },
     ],
+    coinCost: 35,
     buildTime: 10000,
     size: { width: 1, height: 1 },
     effect: { attractionBonus: 'buzzlegum', effectRadius: 20 },
@@ -164,6 +173,7 @@ export const BUILDING_DATA: Record<BuildingType, BuildingData> = {
       { type: ResourceType.Berry, amount: 18 },
       { type: ResourceType.Seed, amount: 8 },
     ],
+    coinCost: 75,
     buildTime: 35000,
     size: { width: 2, height: 1 },
     effect: { workSpeedBonus: 1.3, effectRadius: 8 },
@@ -201,6 +211,11 @@ export class BuildingSystem {
   // Preview for placing buildings (future use)
   private selectedBuildingType: BuildingType | null = null;
 
+  // Unlock checker and coin spender (set by GameScene)
+  private unlockChecker: ((type: BuildingType) => boolean) | null = null;
+  private coinSpender: ((amount: number) => boolean) | null = null;
+  private coinChecker: (() => number) | null = null;
+
   constructor(
     scene: Phaser.Scene,
     resourceManager: ResourceManager,
@@ -211,18 +226,45 @@ export class BuildingSystem {
     this.isoMap = isoMap;
   }
 
+  setUnlockChecker(checker: (type: BuildingType) => boolean): void {
+    this.unlockChecker = checker;
+  }
+
+  setCoinHandlers(checker: () => number, spender: (amount: number) => boolean): void {
+    this.coinChecker = checker;
+    this.coinSpender = spender;
+  }
+
+  isUnlocked(buildingType: BuildingType): boolean {
+    if (!this.unlockChecker) return true; // No checker = all unlocked
+    return this.unlockChecker(buildingType);
+  }
+
   private posKey(x: number, y: number): string {
     return `${x},${y}`;
   }
 
   canAfford(buildingType: BuildingType): boolean {
     const data = BUILDING_DATA[buildingType];
+
+    // Check coin cost
+    if (this.coinChecker && data.coinCost > 0) {
+      if (this.coinChecker() < data.coinCost) {
+        return false;
+      }
+    }
+
+    // Check resource costs
     for (const cost of data.cost) {
       if (this.resourceManager.getStockpileCount(cost.type) < cost.amount) {
         return false;
       }
     }
     return true;
+  }
+
+  getCoinCost(buildingType: BuildingType): number {
+    return BUILDING_DATA[buildingType].coinCost;
   }
 
   canPlace(position: GridPosition, buildingType: BuildingType): boolean {
@@ -250,6 +292,12 @@ export class BuildingSystem {
   }
 
   placeBlueprint(position: GridPosition, buildingType: BuildingType): Building | null {
+    // Check if unlocked
+    if (!this.isUnlocked(buildingType)) {
+      console.log('Building not unlocked yet!');
+      return null;
+    }
+
     if (!this.canPlace(position, buildingType)) {
       return null;
     }
@@ -260,6 +308,14 @@ export class BuildingSystem {
     }
 
     const data = BUILDING_DATA[buildingType];
+
+    // Deduct coins
+    if (this.coinSpender && data.coinCost > 0) {
+      if (!this.coinSpender(data.coinCost)) {
+        console.log('Failed to spend coins!');
+        return null;
+      }
+    }
 
     // Deduct resources
     for (const cost of data.cost) {
