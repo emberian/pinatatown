@@ -8,6 +8,8 @@ import { ZoneManager, ZoneType } from '../world/Zone';
 import { ResourceManager, Resource, ResourceType } from './Resource';
 import { TimeSystem } from '../systems/TimeSystem';
 import { RelationshipSystem } from '../systems/RelationshipSystem';
+import { Trait, TraitEffects, generateTraits, getCombinedEffects, TRAIT_INFO, describeTraits } from '../systems/TraitSystem';
+import { SeasonSystem } from '../systems/SeasonSystem';
 
 export enum MoodState {
   Happy = 'happy',
@@ -74,6 +76,10 @@ export class Pinata extends Phaser.GameObjects.Container {
   public readonly species: PinataSpecies;
   public readonly speciesData: PinataSpeciesData;
 
+  // Traits - personality system
+  public readonly traits: Trait[];
+  private traitEffects: TraitEffects;
+
   // Position in grid coordinates
   private gridX: number;
   private gridY: number;
@@ -83,6 +89,7 @@ export class Pinata extends Phaser.GameObjects.Container {
   private selectionRing: Phaser.GameObjects.Image;
   private nameText: Phaser.GameObjects.Text;
   private statusIcon: Phaser.GameObjects.Text;
+  private traitIcons: Phaser.GameObjects.Text;
 
   // State
   private needs: PinataNeeds;
@@ -100,6 +107,7 @@ export class Pinata extends Phaser.GameObjects.Container {
   private resourceManager: ResourceManager | null = null;
   private timeSystem: TimeSystem | null = null;
   private relationshipSystem: RelationshipSystem | null = null;
+  private seasonSystem: SeasonSystem | null = null;
 
   // Activity state
   private activityTimer = 0;
@@ -145,6 +153,10 @@ export class Pinata extends Phaser.GameObjects.Container {
     this.speciesData = SPECIES_DATA[species];
     this.pathfinder = pathfinder ?? null;
 
+    // Generate traits - this defines personality!
+    this.traits = generateTraits(species, 2 + Math.floor(Math.random() * 2)); // 2-3 traits
+    this.traitEffects = getCombinedEffects(this.traits);
+
     // Generate a cute name
     this.nickname = this.generateName();
 
@@ -185,6 +197,15 @@ export class Pinata extends Phaser.GameObjects.Container {
     });
     this.statusIcon.setOrigin(0.5, 1);
     this.add(this.statusIcon);
+
+    // Create trait icons (shown when selected)
+    const traitIconStr = this.traits.map(t => TRAIT_INFO[t].icon).join('');
+    this.traitIcons = scene.add.text(0, -70, traitIconStr, {
+      fontSize: '10px',
+    });
+    this.traitIcons.setOrigin(0.5, 1);
+    this.traitIcons.setVisible(false);
+    this.add(this.traitIcons);
 
     // Set depth based on position
     this.updateDepth();
@@ -229,6 +250,22 @@ export class Pinata extends Phaser.GameObjects.Container {
 
   setRelationshipSystem(relationshipSystem: RelationshipSystem): void {
     this.relationshipSystem = relationshipSystem;
+  }
+
+  setSeasonSystem(seasonSystem: SeasonSystem): void {
+    this.seasonSystem = seasonSystem;
+  }
+
+  getTraits(): Trait[] {
+    return [...this.traits];
+  }
+
+  getTraitEffects(): TraitEffects {
+    return { ...this.traitEffects };
+  }
+
+  describeTraits(): string {
+    return describeTraits(this.traits);
   }
 
   setPinataList(pinatas: Pinata[]): void {
@@ -321,11 +358,21 @@ export class Pinata extends Phaser.GameObjects.Container {
     // Time of day affects rest decay (get sleepier at night)
     const timeMultiplier = this.timeSystem?.getRestDecayMultiplier() ?? 1.0;
 
+    // Season affects need decay
+    const seasonHungerMult = this.seasonSystem?.getHungerDecayMultiplier() ?? 1.0;
+    const seasonRestMult = this.seasonSystem?.getRestDecayMultiplier() ?? 1.0;
+
+    // Trait effects on need decay
+    const hungerTraitMult = this.traitEffects.hungerDecayMult ?? 1.0;
+    const restTraitMult = this.traitEffects.restDecayMult ?? 1.0;
+    const funTraitMult = this.traitEffects.funDecayMult ?? 1.0;
+    const socialTraitMult = this.traitEffects.socialDecayMult ?? 1.0;
+
     // Different activities affect need decay/gain
-    let hungerDecay = decayRate;
-    let restDecay = decayRate * timeMultiplier;
-    let funDecay = decayRate * 0.8;
-    let socialDecay = decayRate * 0.5;
+    let hungerDecay = decayRate * seasonHungerMult * hungerTraitMult;
+    let restDecay = decayRate * timeMultiplier * seasonRestMult * restTraitMult;
+    let funDecay = decayRate * 0.8 * funTraitMult;
+    let socialDecay = decayRate * 0.5 * socialTraitMult;
 
     // Working makes you hungry and tired faster
     if (this.behavior === BehaviorState.Working) {
@@ -1292,6 +1339,7 @@ export class Pinata extends Phaser.GameObjects.Container {
   select(): void {
     this.selectionRing.setVisible(true);
     this.nameText.setVisible(true);
+    this.traitIcons.setVisible(true);
 
     // Pulse animation on selection ring
     this.scene.tweens.add({
@@ -1307,6 +1355,7 @@ export class Pinata extends Phaser.GameObjects.Container {
   deselect(): void {
     this.selectionRing.setVisible(false);
     this.nameText.setVisible(false);
+    this.traitIcons.setVisible(false);
     this.scene.tweens.killTweensOf(this.selectionRing);
     this.selectionRing.setScale(1);
   }

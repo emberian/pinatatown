@@ -22,6 +22,11 @@ import { RelationshipSystem } from '../systems/RelationshipSystem';
 import { RomanceSystem } from '../systems/RomanceSystem';
 import { SourPinataSystem } from '../systems/SourPinataSystem';
 import { RandomEventSystem } from '../systems/RandomEventSystem';
+import { SeasonSystem } from '../systems/SeasonSystem';
+import { FarmingSystem } from '../systems/FarmingSystem';
+import { BuildingSystem } from '../systems/BuildingSystem';
+import { NotificationSystem } from '../systems/NotificationSystem';
+import { WorkSystem } from '../systems/WorkSystem';
 
 /**
  * Main game scene - handles world rendering and camera controls
@@ -37,6 +42,11 @@ export class GameScene extends Phaser.Scene {
   private romanceSystem!: RomanceSystem;
   private sourPinataSystem!: SourPinataSystem;
   private randomEventSystem!: RandomEventSystem;
+  private seasonSystem!: SeasonSystem;
+  private farmingSystem!: FarmingSystem;
+  private buildingSystem!: BuildingSystem;
+  private notificationSystem!: NotificationSystem;
+  private workSystem!: WorkSystem;
   private gameUI!: GameUI;
 
   private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
@@ -187,17 +197,50 @@ export class GameScene extends Phaser.Scene {
       this.pinatas
     );
 
-    // Connect piñatas to time system and piñata list (for predator/prey)
+    // Create season system (affects resources, needs, visitors)
+    this.seasonSystem = new SeasonSystem(this);
+
+    // Create farming system (garden zones grow crops)
+    this.farmingSystem = new FarmingSystem(
+      this,
+      this.zoneManager,
+      this.resourceManager,
+      this.isoMap
+    );
+    this.farmingSystem.setSeasonSystem(this.seasonSystem);
+
+    // Create building system (structures with benefits)
+    this.buildingSystem = new BuildingSystem(
+      this,
+      this.resourceManager,
+      this.isoMap
+    );
+
+    // Create notification system (player feedback)
+    this.notificationSystem = new NotificationSystem(this);
+
+    // Create work system (job priorities and task assignment)
+    this.workSystem = new WorkSystem(
+      this.zoneManager,
+      this.resourceManager
+    );
+    this.workSystem.setFarmingSystem(this.farmingSystem);
+    this.workSystem.setBuildingSystem(this.buildingSystem);
+
+    // Connect piñatas to all systems
     for (const pinata of this.pinatas) {
       pinata.setTimeSystem(this.timeSystem);
       pinata.setPinataList(this.pinatas);
       pinata.setRelationshipSystem(this.relationshipSystem);
+      pinata.setSeasonSystem(this.seasonSystem);
     }
 
+    // Welcome notification
+    this.notificationSystem.special('Welcome to Piñata Town!', '🎉');
+
     console.log('Piñata Town loaded!');
-    console.log('Controls: [Z] Zone mode | [Space] Pause | Click piñatas to select');
-    console.log('Zones created: Stockpile (brown), Sleep (blue), Recreation (pink)');
-    console.log('New species will be attracted based on your garden!');
+    console.log('Controls: [Z] Zone | [T] Terraform | [C] Command | [L] Log | [Space] Pause');
+    console.log('Seasons cycle every 3 minutes. Prepare for winter!');
   }
 
   private createStartingZones(): void {
@@ -230,6 +273,16 @@ export class GameScene extends Phaser.Scene {
         }
       }
     }
+
+    // Create a garden zone for farming
+    const gardenZone = this.zoneManager.createZone(ZoneType.Garden);
+    for (let x = 10; x <= 13; x++) {
+      for (let y = 18; y <= 21; y++) {
+        if (this.isoMap.isWalkable(x, y)) {
+          gardenZone.addTile({ x, y });
+        }
+      }
+    }
   }
 
   private spawnInitialResources(): void {
@@ -238,6 +291,12 @@ export class GameScene extends Phaser.Scene {
       // Spawn near stockpile and immediately add to stockpile count
       const resource = this.resourceManager.spawnResource(15, 15, ResourceType.Berry);
       this.resourceManager.addToStockpile(resource);
+    }
+
+    // Add seeds for farming
+    for (let i = 0; i < 8; i++) {
+      const seedResource = this.resourceManager.spawnResource(15, 16, ResourceType.Seed);
+      this.resourceManager.addToStockpile(seedResource);
     }
 
     // Also spawn some berries in the world
@@ -554,9 +613,19 @@ export class GameScene extends Phaser.Scene {
       // Update random event system
       this.randomEventSystem.update(delta);
 
-      // Periodically spawn new resources
+      // Update season system
+      this.seasonSystem.update(delta);
+
+      // Update farming system
+      this.farmingSystem.update(delta);
+
+      // Update work system (assigns tasks to idle piñatas)
+      this.workSystem.update(delta, this.pinatas);
+
+      // Periodically spawn new resources (affected by season)
       this.resourceSpawnTimer += delta;
-      if (this.resourceSpawnTimer >= this.RESOURCE_SPAWN_INTERVAL) {
+      const spawnInterval = this.RESOURCE_SPAWN_INTERVAL / this.seasonSystem.getResourceSpawnMultiplier();
+      if (this.resourceSpawnTimer >= spawnInterval) {
         this.resourceSpawnTimer = 0;
         this.spawnRandomResource();
       }
@@ -666,6 +735,7 @@ export class GameScene extends Phaser.Scene {
     const lines = [
       `${p.nickname}`,
       `Species: ${p.speciesData.name}`,
+      `Traits: ${p.describeTraits()}`,
       `Mood: ${p.getMood()} | Job: ${p.getJob()}`,
       `State: ${p.getBehavior()}`,
       `Position: (${pos.x}, ${pos.y})`,
