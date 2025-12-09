@@ -1,6 +1,7 @@
 import Phaser from 'phaser';
 import { PinataSpecies, SPECIES_DATA, PinataSpeciesData } from './PinataTypes';
 import { GridPosition, gridToScreen, getDepth, screenToGridRounded } from '../world/IsoUtils';
+import { IsoMap } from '../world/IsoMap';
 import { Pathfinder } from '../world/Pathfinding';
 import { NEED_MAX, NEED_DECAY_RATE, MOOD_HAPPY_THRESHOLD, MOOD_STRESSED_THRESHOLD, MOOD_BREAKING_THRESHOLD } from '../utils/Constants';
 import { EventBus, GameEvents } from '../utils/EventBus';
@@ -12,6 +13,8 @@ import { Trait, TraitEffects, generateTraits, getCombinedEffects, TRAIT_INFO, de
 import { SeasonSystem } from '../systems/SeasonSystem';
 import { BuildingSystem } from '../systems/BuildingSystem';
 import { FarmingSystem, CropStage } from '../systems/FarmingSystem';
+import { GoalQueue, Goal, GoalType, GoalSource, createGoal, BASE_PRIORITIES } from '../systems/GoalSystem';
+import { PerceptionSystem } from '../systems/PerceptionSystem';
 
 export enum MoodState {
   Happy = 'happy',
@@ -102,6 +105,7 @@ export class Pinata extends Phaser.GameObjects.Container {
   private mood: MoodState = MoodState.Content;
   private behavior: BehaviorState = BehaviorState.Idle;
   private job: JobType = JobType.Idle;
+  private isWild: boolean = false; // Wild predators spawned by ThreatSystem
 
   // Movement
   private pathfinder: Pathfinder | null = null;
@@ -116,6 +120,7 @@ export class Pinata extends Phaser.GameObjects.Container {
   private seasonSystem: SeasonSystem | null = null;
   private buildingSystem: BuildingSystem | null = null;
   private farmingSystem: FarmingSystem | null = null;
+  private isoMap: IsoMap | null = null;
 
   // Work task (assigned by WorkSystem)
   private currentWorkTask: { type: string; data: unknown; position: GridPosition } | null = null;
@@ -138,8 +143,17 @@ export class Pinata extends Phaser.GameObjects.Container {
   // Social state
   private socialTarget: Pinata | null = null;
 
+  // Zone occupancy tracking
+  private currentOccupiedZone: { zone: import('../world/Zone').Zone; type: import('../world/Zone').ZoneType } | null = null;
+
   // Production state
   private productionTimer = 0;
+
+  // Goal-based AI
+  private goalQueue: GoalQueue = new GoalQueue();
+  private perceptionSystem: PerceptionSystem | null = null;
+  private lastPerceptionScan = 0;
+  private readonly PERCEPTION_SCAN_INTERVAL = 1000; // Scan every second
 
   // Animation
   private bobTween: Phaser.Tweens.Tween | null = null;
@@ -275,6 +289,125 @@ export class Pinata extends Phaser.GameObjects.Container {
     this.farmingSystem = farmingSystem;
   }
 
+  setPerceptionSystem(perceptionSystem: PerceptionSystem): void {
+    this.perceptionSystem = perceptionSystem;
+  }
+
+  setIsoMap(isoMap: IsoMap): void {
+    this.isoMap = isoMap;
+  }
+
+  /**
+   * Register as occupying a zone (for activity glow)
+   */
+  private registerWithZone(zoneType: ZoneType): void {
+    if (!this.zoneManager) return;
+
+    const zone = this.zoneManager.getZoneAt({ x: this.gridX, y: this.gridY });
+    if (zone && zone.type === zoneType) {
+      zone.registerOccupant(this.id);
+      this.currentOccupiedZone = { zone, type: zoneType };
+    }
+  }
+
+  /**
+   * Unregister from currently occupied zone
+   */
+  private unregisterFromZone(): void {
+    if (this.currentOccupiedZone) {
+      this.currentOccupiedZone.zone.unregisterOccupant(this.id);
+      this.currentOccupiedZone = null;
+    }
+  }
+
+  // ========== Goal System Methods ==========
+
+  getGoalQueue(): GoalQueue {
+    return this.goalQueue;
+  }
+
+  addGoal(goal: Goal): void {
+    this.goalQueue.add(goal);
+  }
+
+  getCurrentGoal(): Goal | null {
+    return this.goalQueue.getActive();
+  }
+
+  /**
+   * Generate goals from internal needs (hunger, rest, fun, social)
+   * Called periodically to keep goal queue populated with survival needs
+   */
+  private generateNeedGoals(): void {
+    const needs = this.needs;
+
+    // Hunger goal - urgency scales with how hungry
+    if (needs.hunger < 60 && !this.goalQueue.hasGoalOfType(GoalType.SatisfyHunger)) {
+      const urgency = Math.max(0, (60 - needs.hunger) / 60); // 0 to 1
+      const priority = BASE_PRIORITIES[GoalType.SatisfyHunger] + urgency * 50;
+
+      // Only create if there's food available
+      if (this.resourceManager && this.resourceManager.getTotalFood() > 0) {
+        this.goalQueue.add(createGoal(GoalType.SatisfyHunger, GoalSource.Internal, {
+          basePriority: priority,
+        }));
+      }
+    }
+
+    // Rest goal
+    if (needs.rest < 50 && !this.goalQueue.hasGoalOfType(GoalType.SatisfyRest)) {
+      const urgency = Math.max(0, (50 - needs.rest) / 50);
+      const priority = BASE_PRIORITIES[GoalType.SatisfyRest] + urgency * 45;
+
+      this.goalQueue.add(createGoal(GoalType.SatisfyRest, GoalSource.Internal, {
+        basePriority: priority,
+      }));
+    }
+
+    // Fun goal
+    if (needs.fun < 40 && !this.goalQueue.hasGoalOfType(GoalType.SatisfyFun)) {
+      const urgency = Math.max(0, (40 - needs.fun) / 40);
+      const priority = BASE_PRIORITIES[GoalType.SatisfyFun] + urgency * 30;
+
+      this.goalQueue.add(createGoal(GoalType.SatisfyFun, GoalSource.Internal, {
+        basePriority: priority,
+      }));
+    }
+
+    // Social goal
+    if (needs.social < 35 && !this.goalQueue.hasGoalOfType(GoalType.SatisfySocial)) {
+      const urgency = Math.max(0, (35 - needs.social) / 35);
+      const priority = BASE_PRIORITIES[GoalType.SatisfySocial] + urgency * 25;
+
+      this.goalQueue.add(createGoal(GoalType.SatisfySocial, GoalSource.Internal, {
+        basePriority: priority,
+      }));
+    }
+
+    // Default wander goal if nothing else to do
+    if (this.goalQueue.getAll().length === 0) {
+      this.goalQueue.add(createGoal(GoalType.Wander, GoalSource.Internal));
+    }
+  }
+
+  /**
+   * Determine mental break type based on traits
+   */
+  private getMentalBreakType(): GoalType {
+    const traitSet = new Set(this.traits);
+
+    if (traitSet.has(Trait.Pyromaniac)) {
+      return GoalType.MentalBreakFire;
+    }
+    if (traitSet.has(Trait.Aggressive)) {
+      return GoalType.MentalBreakTantrum;
+    }
+    if (traitSet.has(Trait.Cowardly) || traitSet.has(Trait.Neurotic)) {
+      return GoalType.MentalBreakHide;
+    }
+    return GoalType.MentalBreakWander;
+  }
+
   // Called by WorkSystem to assign a task
   assignWorkTask(type: string, position: GridPosition, data: unknown): void {
     this.currentWorkTask = { type, position, data };
@@ -313,6 +446,22 @@ export class Pinata extends Phaser.GameObjects.Container {
     return this.species === PinataSpecies.Pretztail;
   }
 
+  /**
+   * Mark this piñata as wild (spawned by ThreatSystem raid)
+   * Wild predators are more aggressive and won't settle
+   */
+  markAsWild(): void {
+    this.isWild = true;
+    // Wild predators are hungry and aggressive
+    this.needs.hunger = 20;
+    // They don't have names shown to player
+    this.nameText.setVisible(false);
+  }
+
+  getIsWild(): boolean {
+    return this.isWild;
+  }
+
   isGuard(): boolean {
     return this.species === PinataSpecies.Rashberry || this.job === JobType.Guard;
   }
@@ -332,7 +481,18 @@ export class Pinata extends Phaser.GameObjects.Container {
       this.huntCooldown -= delta;
     }
 
-    // Check for nearby threats (flee from predators!)
+    // Periodic perception scan - notice things in the environment
+    this.lastPerceptionScan += delta;
+    if (this.lastPerceptionScan >= this.PERCEPTION_SCAN_INTERVAL) {
+      this.lastPerceptionScan = 0;
+      if (this.perceptionSystem) {
+        this.perceptionSystem.scanNearbyEntities(this);
+      }
+      // Also generate internal need-based goals
+      this.generateNeedGoals();
+    }
+
+    // Check for nearby threats (flee from predators!) - legacy, will migrate to perception
     this.checkForThreats();
 
     // Decay needs over time
@@ -341,8 +501,21 @@ export class Pinata extends Phaser.GameObjects.Container {
     // Update mood based on needs
     this.updateMood();
 
-    // Execute behavior (includes need-seeking AI)
-    this.updateBehavior(delta);
+    // Mental break handling - create mental break goal if in breaking mood
+    if (this.mood === MoodState.Breaking) {
+      const breakType = this.getMentalBreakType();
+      if (!this.goalQueue.hasGoalOfType(breakType)) {
+        this.goalQueue.add(createGoal(breakType, GoalSource.Internal, {
+          basePriority: 90 + Math.random() * 10, // High priority with some variance
+        }));
+      }
+    }
+
+    // Evaluate goals and pick highest priority
+    const activeGoal = this.goalQueue.evaluate(this.traits);
+
+    // Execute behavior based on active goal (or legacy behavior state)
+    this.updateBehaviorFromGoal(delta, activeGoal);
 
     // Handle production (for producers like Moozipan, Buzzlegum)
     this.updateProduction(delta);
@@ -350,6 +523,102 @@ export class Pinata extends Phaser.GameObjects.Container {
     // Update visuals
     this.updateVisuals();
     this.updateStatusIcon();
+  }
+
+  /**
+   * Execute behavior based on the active goal
+   * Bridges new goal system with existing behavior logic
+   */
+  private updateBehaviorFromGoal(delta: number, goal: Goal | null): void {
+    if (!goal) {
+      this.updateBehavior(delta);
+      return;
+    }
+
+    // Map goals to behaviors and execute
+    switch (goal.type) {
+      case GoalType.SatisfyHunger:
+        this.executeHungerGoal(delta, goal);
+        break;
+
+      case GoalType.SatisfyRest:
+        this.executeRestGoal(delta, goal);
+        break;
+
+      case GoalType.SatisfyFun:
+        this.executeFunGoal(delta, goal);
+        break;
+
+      case GoalType.SatisfySocial:
+        this.executeSocialGoal(delta, goal);
+        break;
+
+      case GoalType.FleeFromThreat:
+        this.executeFleeGoal(delta, goal);
+        break;
+
+      case GoalType.HelpFriend:
+        this.executeHelpFriendGoal(delta, goal);
+        break;
+
+      case GoalType.DefendAlly:
+        this.executeDefendGoal(delta, goal);
+        break;
+
+      case GoalType.GatherResource:
+      case GoalType.DeliverResource:
+        this.executeGatherGoal(delta, goal);
+        break;
+
+      case GoalType.FarmCrop:
+        this.executeFarmGoal(delta, goal);
+        break;
+
+      case GoalType.BuildStructure:
+        this.executeBuildGoal(delta, goal);
+        break;
+
+      case GoalType.GuardArea:
+        this.executeGuardGoal(delta, goal);
+        break;
+
+      case GoalType.Hunt:
+      case GoalType.Stalk:
+        this.executeHuntGoal(delta, goal);
+        break;
+
+      case GoalType.SeekCompanion:
+        this.executeSeekCompanionGoal(delta, goal);
+        break;
+
+      case GoalType.AvoidRival:
+        this.executeAvoidRivalGoal(delta, goal);
+        break;
+
+      case GoalType.MournDeath:
+        this.executeMournGoal(delta, goal);
+        break;
+
+      case GoalType.InvestigateEvent:
+        this.executeInvestigateGoal(delta, goal);
+        break;
+
+      case GoalType.MentalBreakWander:
+      case GoalType.MentalBreakHide:
+      case GoalType.MentalBreakTantrum:
+      case GoalType.MentalBreakFire:
+        this.executeMentalBreakGoal(delta, goal);
+        break;
+
+      case GoalType.Wander:
+        this.executeWanderGoal(delta, goal);
+        break;
+
+      case GoalType.Idle:
+      default:
+        this.updateBehavior(delta);
+        break;
+    }
   }
 
   private updateProduction(delta: number): void {
@@ -654,7 +923,8 @@ export class Pinata extends Phaser.GameObjects.Container {
 
       if (this.targetResource && this.targetResource.isAvailable()) {
         this.carriedResource = this.targetResource;
-        this.carriedResource.pickup();
+        // Attach resource visually to this piñata (shows above head)
+        this.carriedResource.attachToCarrier(this);
         this.targetResource = null;
 
         // Now carry to stockpile
@@ -684,6 +954,11 @@ export class Pinata extends Phaser.GameObjects.Container {
       this.activityTimer = 0;
 
       if (this.carriedResource && this.resourceManager) {
+        // Detach from carrier before storing
+        this.carriedResource.detachFromCarrier();
+        this.remove(this.carriedResource);
+        this.scene.add.existing(this.carriedResource); // Re-add to scene
+
         this.resourceManager.addToStockpile(this.carriedResource);
         EventBus.emit(GameEvents.RESOURCE_COLLECTED, this, this.carriedResource);
         this.carriedResource = null;
@@ -833,6 +1108,7 @@ export class Pinata extends Phaser.GameObjects.Container {
 
       // Wake up if rested enough
       if (this.needs.rest >= NEED_SATISFIED_THRESHOLD) {
+        this.unregisterFromZone(); // Stop zone glow
         this.behavior = BehaviorState.Idle;
         this.idleTimer = 0;
       }
@@ -859,6 +1135,7 @@ export class Pinata extends Phaser.GameObjects.Container {
 
       // Stop playing if fun is satisfied
       if (this.needs.fun >= NEED_SATISFIED_THRESHOLD) {
+        this.unregisterFromZone(); // Stop zone glow
         this.behavior = BehaviorState.Idle;
         this.idleTimer = 0;
       }
@@ -1306,7 +1583,16 @@ export class Pinata extends Phaser.GameObjects.Container {
     const dy = targetScreen.y - this.y;
     const distance = Math.sqrt(dx * dx + dy * dy);
 
-    const speed = this.speciesData.baseSpeed * (this.mood === MoodState.Happy ? 1.2 : 1);
+    // Base speed with mood bonus
+    let speed = this.speciesData.baseSpeed * (this.mood === MoodState.Happy ? 1.2 : 1);
+
+    // Apply terrain speed modifier
+    if (this.isoMap) {
+      const terrainEffect = this.isoMap.getTerrainEffect(this.gridX, this.gridY);
+      if (terrainEffect) {
+        speed *= terrainEffect.speedModifier;
+      }
+    }
     const moveDistance = speed * (delta / 1000);
 
     if (distance <= moveDistance) {
@@ -1347,12 +1633,14 @@ export class Pinata extends Phaser.GameObjects.Container {
         // Start sleeping
         this.behavior = BehaviorState.Sleeping;
         this.activityTimer = 0;
+        this.registerWithZone(ZoneType.Sleep); // Zone glow
         break;
 
       case BehaviorState.SeekingFun:
         // Start playing
         this.behavior = BehaviorState.Playing;
         this.activityTimer = 0;
+        this.registerWithZone(ZoneType.Recreation); // Zone glow
         break;
 
       case BehaviorState.SeekingSocial:
@@ -1590,6 +1878,10 @@ export class Pinata extends Phaser.GameObjects.Container {
     this.needs.fun = Math.min(NEED_MAX, this.needs.fun + amount);
   }
 
+  boostSocial(amount: number): void {
+    this.needs.social = Math.min(NEED_MAX, this.needs.social + amount);
+  }
+
   socialize(): void {
     this.behavior = BehaviorState.Socializing;
   }
@@ -1635,7 +1927,583 @@ export class Pinata extends Phaser.GameObjects.Container {
     console.log(`${this.nickname} staying put`);
   }
 
+  // ========== Goal Execution Methods ==========
+
+  private executeHungerGoal(delta: number, _goal: Goal): void {
+    // States: seeking food → eating → done
+    if (this.behavior === BehaviorState.Eating) {
+      this.handleEating(delta);
+      if (this.needs.hunger >= NEED_SATISFIED_THRESHOLD) {
+        this.goalQueue.completeActive();
+      }
+      return;
+    }
+
+    // Not at food yet - go find some
+    if (this.behavior !== BehaviorState.SeekingFood && this.zoneManager && this.resourceManager) {
+      const stockpile = this.zoneManager.findNearestZone(
+        { x: this.gridX, y: this.gridY },
+        ZoneType.Stockpile
+      );
+      if (stockpile && this.resourceManager.getTotalFood() > 0) {
+        if (this.moveToGrid(stockpile.tile.x, stockpile.tile.y)) {
+          this.behavior = BehaviorState.SeekingFood;
+        }
+      } else {
+        // No food available, fail goal
+        this.goalQueue.failActive();
+      }
+    } else {
+      this.updateMovement(delta);
+    }
+  }
+
+  private executeRestGoal(delta: number, _goal: Goal): void {
+    if (this.behavior === BehaviorState.Sleeping) {
+      this.handleSleeping(delta);
+      if (this.needs.rest >= NEED_SATISFIED_THRESHOLD) {
+        this.goalQueue.completeActive();
+      }
+      return;
+    }
+
+    // Find sleep zone
+    if (this.behavior !== BehaviorState.SeekingSleep && this.zoneManager) {
+      const sleepZone = this.zoneManager.findNearestZone(
+        { x: this.gridX, y: this.gridY },
+        ZoneType.Sleep
+      );
+      if (sleepZone && this.moveToGrid(sleepZone.tile.x, sleepZone.tile.y)) {
+        this.behavior = BehaviorState.SeekingSleep;
+      } else {
+        // No sleep zone - just sleep wherever
+        this.behavior = BehaviorState.Sleeping;
+        this.activityTimer = 0;
+      }
+    } else {
+      this.updateMovement(delta);
+    }
+  }
+
+  private executeFunGoal(delta: number, _goal: Goal): void {
+    if (this.behavior === BehaviorState.Playing) {
+      this.handlePlaying(delta);
+      if (this.needs.fun >= NEED_SATISFIED_THRESHOLD) {
+        this.goalQueue.completeActive();
+      }
+      return;
+    }
+
+    if (this.behavior !== BehaviorState.SeekingFun && this.zoneManager) {
+      const funZone = this.zoneManager.findNearestZone(
+        { x: this.gridX, y: this.gridY },
+        ZoneType.Recreation
+      );
+      if (funZone && this.moveToGrid(funZone.tile.x, funZone.tile.y)) {
+        this.behavior = BehaviorState.SeekingFun;
+      } else {
+        // No fun zone - wander instead (that's kind of fun)
+        this.startWandering();
+        this.needs.fun = Math.min(NEED_MAX, this.needs.fun + 5);
+        this.goalQueue.completeActive();
+      }
+    } else {
+      this.updateMovement(delta);
+    }
+  }
+
+  private executeSocialGoal(delta: number, _goal: Goal): void {
+    if (this.behavior === BehaviorState.Socializing) {
+      this.handleSocializing(delta);
+      if (this.needs.social >= NEED_SATISFIED_THRESHOLD) {
+        this.goalQueue.completeActive();
+      }
+      return;
+    }
+
+    // Find someone to socialize with
+    if (this.behavior !== BehaviorState.SeekingSocial) {
+      const target = this.findSocialTarget();
+      if (target) {
+        const targetPos = target.getGridPosition();
+        if (this.moveToGrid(targetPos.x, targetPos.y)) {
+          this.socialTarget = target;
+          this.behavior = BehaviorState.SeekingSocial;
+        }
+      } else {
+        // No one to talk to
+        this.goalQueue.failActive();
+      }
+    } else {
+      this.updateMovement(delta);
+    }
+  }
+
+  private executeFleeGoal(delta: number, goal: Goal): void {
+    // Find the threat
+    let threat: Pinata | null = null;
+    if (goal.targetEntityId !== undefined) {
+      threat = this.allPinatas.find(p => p.id === goal.targetEntityId) ?? null;
+    }
+
+    if (!threat || !threat.getIsAlive()) {
+      // Threat gone
+      this.goalQueue.completeActive();
+      this.behavior = BehaviorState.Idle;
+      return;
+    }
+
+    const dist = this.distanceTo(threat);
+    if (dist > 15) {
+      // Escaped!
+      this.goalQueue.completeActive();
+      this.behavior = BehaviorState.Idle;
+      return;
+    }
+
+    // Keep fleeing
+    if (this.behavior !== BehaviorState.Fleeing || this.currentPath.length === 0) {
+      this.startFleeing(threat);
+    }
+    this.updateMovement(delta);
+  }
+
+  private executeHelpFriendGoal(delta: number, goal: Goal): void {
+    // Find the friend who needs help
+    const friend = this.allPinatas.find(p => p.id === goal.targetEntityId);
+
+    if (!friend || !friend.getIsAlive()) {
+      this.goalQueue.failActive();
+      return;
+    }
+
+    const friendNeeds = friend.getNeeds();
+
+    // Check if friend still needs help
+    if (friendNeeds.hunger >= 40) {
+      // Friend is okay now
+      this.goalQueue.completeActive();
+      console.log(`${this.nickname} sees ${friend.nickname} is okay now`);
+      return;
+    }
+
+    const dist = this.distanceTo(friend);
+
+    if (dist <= 2) {
+      // Close enough - give help
+      // If we're carrying food, give it
+      if (this.carriedResource && this.resourceManager) {
+        const resourceType = this.carriedResource.resourceType;
+        // Check if it's food
+        if (resourceType === ResourceType.Berry || resourceType === ResourceType.Seed ||
+            resourceType === ResourceType.Honey || resourceType === ResourceType.CandyMilk) {
+          friend.feed(30);
+          // Detach from carrier before removing
+          this.carriedResource.detachFromCarrier();
+          this.remove(this.carriedResource);
+          this.resourceManager.removeResource(this.carriedResource);
+          this.carriedResource = null;
+          EventBus.emit(GameEvents.PINATA_HELPED, this, friend);
+          console.log(`${this.nickname} shared food with ${friend.nickname}!`);
+          this.goalQueue.completeActive();
+          return;
+        }
+      }
+
+      // Otherwise, just provide comfort (social boost)
+      friend.boostSocial(10);
+      this.needs.social = Math.min(NEED_MAX, this.needs.social + 15); // Feels good to help
+      EventBus.emit(GameEvents.PINATA_HELPED, this, friend);
+      console.log(`${this.nickname} comforted ${friend.nickname}`);
+      this.goalQueue.completeActive();
+    } else {
+      // Move toward friend
+      if (this.currentPath.length === 0) {
+        const friendPos = friend.getGridPosition();
+        this.moveToGrid(friendPos.x, friendPos.y);
+      }
+      this.updateMovement(delta);
+    }
+  }
+
+  private executeDefendGoal(delta: number, goal: Goal): void {
+    const threat = this.allPinatas.find(p => p.id === goal.targetEntityId);
+
+    if (!threat || !threat.getIsAlive()) {
+      this.goalQueue.completeActive();
+      this.behavior = BehaviorState.Idle;
+      return;
+    }
+
+    const dist = this.distanceTo(threat);
+
+    if (dist <= 2) {
+      // Fight!
+      this.threat = threat;
+      this.behavior = BehaviorState.Fighting;
+      this.handleFighting(delta);
+    } else {
+      // Move toward threat
+      if (this.currentPath.length === 0) {
+        const threatPos = threat.getGridPosition();
+        this.moveToGrid(threatPos.x, threatPos.y);
+      }
+      this.updateMovement(delta);
+    }
+  }
+
+  private executeGatherGoal(delta: number, goal: Goal): void {
+    // Use existing gather logic
+    if (this.behavior === BehaviorState.PickingUpResource) {
+      this.handlePickingUp(delta);
+      return;
+    }
+
+    if (this.behavior === BehaviorState.CarryingToStockpile) {
+      this.updateMovement(delta);
+      return;
+    }
+
+    if (this.behavior === BehaviorState.DroppingResource) {
+      this.handleDroppingResource(delta);
+      if (!this.carriedResource) {
+        this.goalQueue.completeActive();
+      }
+      return;
+    }
+
+    // Find resource to gather
+    if (!this.targetResource && this.resourceManager) {
+      const resource = goal.targetResourceId
+        ? this.resourceManager.findResourceById(goal.targetResourceId)
+        : this.resourceManager.findNearestResource({ x: this.gridX, y: this.gridY });
+
+      if (resource && resource.isAvailable()) {
+        this.targetResource = resource;
+        const pos = resource.getGridPosition();
+        if (this.moveToGrid(pos.x, pos.y)) {
+          this.behavior = BehaviorState.SeekingResource;
+        }
+      } else {
+        this.goalQueue.failActive();
+      }
+    } else {
+      this.updateMovement(delta);
+    }
+  }
+
+  private executeFarmGoal(delta: number, goal: Goal): void {
+    // Use existing farming behavior
+    if (this.behavior === BehaviorState.Farming) {
+      this.handleFarmingWork(delta);
+      return;
+    }
+
+    // Go to the crop location
+    const targetPos = goal.targetPosition;
+    if (!targetPos) {
+      this.goalQueue.failActive();
+      return;
+    }
+
+    const dist = Math.sqrt(
+      Math.pow(this.gridX - targetPos.x, 2) +
+      Math.pow(this.gridY - targetPos.y, 2)
+    );
+
+    if (dist <= 1) {
+      // At the crop - start farming
+      this.behavior = BehaviorState.Farming;
+      this.activityTimer = 0;
+    } else {
+      if (this.currentPath.length === 0) {
+        this.moveToGrid(targetPos.x, targetPos.y);
+        this.behavior = BehaviorState.GoingToWork;
+      }
+      this.updateMovement(delta);
+    }
+  }
+
+  private executeBuildGoal(delta: number, goal: Goal): void {
+    // Use existing building behavior
+    if (this.behavior === BehaviorState.Building) {
+      this.handleBuildingWork(delta);
+      return;
+    }
+
+    const targetPos = goal.targetPosition;
+    if (!targetPos) {
+      this.goalQueue.failActive();
+      return;
+    }
+
+    const dist = Math.sqrt(
+      Math.pow(this.gridX - targetPos.x, 2) +
+      Math.pow(this.gridY - targetPos.y, 2)
+    );
+
+    if (dist <= 1) {
+      this.behavior = BehaviorState.Building;
+      this.activityTimer = 0;
+    } else {
+      if (this.currentPath.length === 0) {
+        this.moveToGrid(targetPos.x, targetPos.y);
+        this.behavior = BehaviorState.GoingToWork;
+      }
+      this.updateMovement(delta);
+    }
+  }
+
+  private executeGuardGoal(delta: number, goal: Goal): void {
+    const targetPos = goal.targetPosition;
+    if (!targetPos) {
+      this.goalQueue.failActive();
+      return;
+    }
+
+    const dist = Math.sqrt(
+      Math.pow(this.gridX - targetPos.x, 2) +
+      Math.pow(this.gridY - targetPos.y, 2)
+    );
+
+    if (dist <= 3) {
+      // At guard position - patrol and watch
+      this.behavior = BehaviorState.Guarding;
+      goal.progress = (goal.progress ?? 0) + delta;
+
+      // Occasionally wander within guard area
+      if (this.currentPath.length === 0 && Math.random() < 0.02) {
+        const wanderX = targetPos.x + Math.floor(Math.random() * 6) - 3;
+        const wanderY = targetPos.y + Math.floor(Math.random() * 6) - 3;
+        this.moveToGrid(wanderX, wanderY);
+      }
+      this.updateMovement(delta);
+
+      // Guard shift ends after 30 seconds
+      if ((goal.progress ?? 0) >= 30000) {
+        this.goalQueue.completeActive();
+      }
+    } else {
+      if (this.currentPath.length === 0) {
+        this.moveToGrid(targetPos.x, targetPos.y);
+      }
+      this.updateMovement(delta);
+    }
+  }
+
+  private executeHuntGoal(delta: number, _goal: Goal): void {
+    // Use existing hunt logic
+    if (this.behavior === BehaviorState.Attacking) {
+      this.handleAttacking(delta);
+      if (!this.targetPrey) {
+        this.goalQueue.completeActive();
+      }
+      return;
+    }
+
+    this.handleHunting(delta);
+  }
+
+  private executeSeekCompanionGoal(delta: number, goal: Goal): void {
+    const companion = this.allPinatas.find(p => p.id === goal.targetEntityId);
+
+    if (!companion || !companion.getIsAlive()) {
+      this.goalQueue.failActive();
+      return;
+    }
+
+    const dist = this.distanceTo(companion);
+
+    if (dist <= 2) {
+      // Start socializing
+      this.socialTarget = companion;
+      this.behavior = BehaviorState.Socializing;
+      this.activityTimer = 0;
+      this.handleSocializing(delta);
+      this.goalQueue.completeActive();
+    } else {
+      if (this.currentPath.length === 0) {
+        const companionPos = companion.getGridPosition();
+        this.moveToGrid(companionPos.x, companionPos.y);
+      }
+      this.updateMovement(delta);
+    }
+  }
+
+  private executeAvoidRivalGoal(delta: number, goal: Goal): void {
+    const rival = this.allPinatas.find(p => p.id === goal.targetEntityId);
+
+    if (!rival || !rival.getIsAlive()) {
+      this.goalQueue.completeActive();
+      return;
+    }
+
+    const dist = this.distanceTo(rival);
+
+    if (dist > 10) {
+      // Far enough away
+      this.goalQueue.completeActive();
+      return;
+    }
+
+    // Move away from rival
+    if (this.currentPath.length === 0) {
+      const rivalPos = rival.getGridPosition();
+      const dx = this.gridX - rivalPos.x;
+      const dy = this.gridY - rivalPos.y;
+      const normDist = Math.sqrt(dx * dx + dy * dy) || 1;
+
+      const awayX = Math.round(this.gridX + (dx / normDist) * 8);
+      const awayY = Math.round(this.gridY + (dy / normDist) * 8);
+      this.moveToGrid(awayX, awayY);
+    }
+    this.updateMovement(delta);
+  }
+
+  private executeMournGoal(delta: number, goal: Goal): void {
+    // Mourn at the death location
+    const deathPos = goal.targetPosition;
+    if (!deathPos) {
+      this.goalQueue.completeActive();
+      return;
+    }
+
+    const dist = Math.sqrt(
+      Math.pow(this.gridX - deathPos.x, 2) +
+      Math.pow(this.gridY - deathPos.y, 2)
+    );
+
+    if (dist <= 2) {
+      // At death site - mourn
+      goal.progress = (goal.progress ?? 0) + delta;
+
+      // Mourning reduces fun and social, but is necessary
+      this.needs.fun = Math.max(0, this.needs.fun - 0.1);
+      this.needs.social = Math.max(0, this.needs.social - 0.05);
+
+      // Done mourning after 10 seconds
+      if ((goal.progress ?? 0) >= 10000) {
+        console.log(`${this.nickname} finished mourning`);
+        this.goalQueue.completeActive();
+      }
+    } else {
+      if (this.currentPath.length === 0) {
+        this.moveToGrid(deathPos.x, deathPos.y);
+      }
+      this.updateMovement(delta);
+    }
+  }
+
+  private executeInvestigateGoal(delta: number, goal: Goal): void {
+    const targetPos = goal.targetPosition;
+    if (!targetPos) {
+      this.goalQueue.completeActive();
+      return;
+    }
+
+    const dist = Math.sqrt(
+      Math.pow(this.gridX - targetPos.x, 2) +
+      Math.pow(this.gridY - targetPos.y, 2)
+    );
+
+    if (dist <= 2) {
+      // Investigated!
+      console.log(`${this.nickname} investigated something interesting`);
+      // Investigating satisfies curiosity (fun boost)
+      this.needs.fun = Math.min(NEED_MAX, this.needs.fun + 10);
+      this.goalQueue.completeActive();
+    } else {
+      if (this.currentPath.length === 0) {
+        this.moveToGrid(targetPos.x, targetPos.y);
+      }
+      this.updateMovement(delta);
+    }
+  }
+
+  private executeMentalBreakGoal(delta: number, goal: Goal): void {
+    switch (goal.type) {
+      case GoalType.MentalBreakWander:
+        // Aimless wandering
+        if (this.currentPath.length === 0 && Math.random() < 0.02) {
+          this.startWandering();
+        }
+        this.updateMovement(delta);
+        break;
+
+      case GoalType.MentalBreakHide:
+        // Find a corner and hide
+        if (this.behavior !== BehaviorState.Sleeping) {
+          // Find nearest building or zone edge
+          if (this.zoneManager) {
+            const sleepZone = this.zoneManager.findNearestZone(
+              { x: this.gridX, y: this.gridY },
+              ZoneType.Sleep
+            );
+            if (sleepZone && this.moveToGrid(sleepZone.tile.x, sleepZone.tile.y)) {
+              this.behavior = BehaviorState.SeekingSleep;
+            }
+          }
+        }
+        this.updateMovement(delta);
+        break;
+
+      case GoalType.MentalBreakTantrum:
+        // Aggressive wandering, might pick fights
+        if (this.currentPath.length === 0) {
+          this.startWandering();
+        }
+        this.updateMovement(delta);
+
+        // Might attack nearby non-predators
+        if (Math.random() < 0.01) {
+          for (const other of this.allPinatas) {
+            if (other === this || !other.getIsAlive() || other.isPredator()) continue;
+            if (this.distanceTo(other) < 3) {
+              this.threat = other;
+              this.behavior = BehaviorState.Fighting;
+              break;
+            }
+          }
+        }
+        break;
+
+      case GoalType.MentalBreakFire:
+        // TODO: Implement fire starting when we have fire system
+        // For now, just wander angrily
+        if (this.currentPath.length === 0) {
+          this.startWandering();
+        }
+        this.updateMovement(delta);
+        console.log(`${this.nickname} is looking for something to burn...`);
+        break;
+    }
+
+    // Check if we've recovered from mental break
+    const avgNeed = (this.needs.hunger + this.needs.rest + this.needs.fun + this.needs.social) / 4;
+    const minNeed = Math.min(this.needs.hunger, this.needs.rest, this.needs.fun, this.needs.social);
+    if (avgNeed > 50 && minNeed > 30) {
+      this.mood = MoodState.Stressed;
+      this.goalQueue.completeActive();
+    }
+  }
+
+  private executeWanderGoal(delta: number, goal: Goal): void {
+    if (this.currentPath.length === 0) {
+      this.startWandering();
+      goal.progress = (goal.progress ?? 0) + 1;
+
+      // Complete after a few wanders
+      if ((goal.progress ?? 0) >= 3) {
+        this.goalQueue.completeActive();
+      }
+    }
+    this.updateMovement(delta);
+  }
+
   destroy(): void {
+    // Cleanup zone occupancy before destroying
+    this.unregisterFromZone();
+
     if (this.bobTween) {
       this.bobTween.destroy();
     }

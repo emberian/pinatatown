@@ -1,5 +1,6 @@
 import Phaser from 'phaser';
 import { GridPosition, gridToScreen, getDepth } from '../world/IsoUtils';
+import { ZoneManager, ZoneType } from '../world/Zone';
 
 export enum ResourceType {
   Berry = 'berry',
@@ -127,7 +128,45 @@ export class Resource extends Phaser.GameObjects.Container {
 
   storeInStockpile(): void {
     this.isInStockpile = true;
-    this.setVisible(false); // Hidden when in stockpile
+    // No longer hide - resources stay visible in piles
+  }
+
+  /**
+   * Move resource to a stockpile pile position with vertical stacking
+   */
+  moveToStockpilePile(pos: GridPosition, stackIndex: number): void {
+    this.isInStockpile = true;
+    this.isBeingCarried = false;
+    this.gridX = pos.x;
+    this.gridY = pos.y;
+
+    const screenPos = gridToScreen(pos.x, pos.y);
+    // Stack upward with slight random offset for organic look
+    const yOffset = -stackIndex * 4;
+    const xOffset = (Math.random() - 0.5) * 6;
+    this.setPosition(screenPos.x + xOffset, screenPos.y + yOffset - 8);
+    this.setDepth(getDepth(pos.x, pos.y, 0.5 + stackIndex * 0.01));
+    this.setVisible(true);
+  }
+
+  /**
+   * Attach resource visually to a carrier (piñata carrying it)
+   */
+  attachToCarrier(carrier: Phaser.GameObjects.Container): void {
+    this.isBeingCarried = true;
+    // Reparent to carrier, position above head
+    carrier.add(this);
+    this.setPosition(0, -50);
+    this.setVisible(true);
+    this.setDepth(10); // Above carrier sprite
+  }
+
+  /**
+   * Detach from carrier before dropping/storing
+   */
+  detachFromCarrier(): void {
+    this.isBeingCarried = false;
+    // Caller will handle repositioning
   }
 
   isCarried(): boolean {
@@ -151,6 +190,13 @@ export class ResourceManager {
   private resources: Resource[] = [];
   private stockpileResources: Map<ResourceType, number> = new Map();
 
+  // Zone manager reference for finding stockpile positions
+  private zoneManager: ZoneManager | null = null;
+
+  // Track resources at each stockpile tile position
+  // Key is "x,y", value is array of resources at that position
+  private stockpilePiles: Map<string, Resource[]> = new Map();
+
   constructor(scene: Phaser.Scene) {
     this.scene = scene;
 
@@ -158,6 +204,10 @@ export class ResourceManager {
     for (const type of Object.values(ResourceType)) {
       this.stockpileResources.set(type, 0);
     }
+  }
+
+  setZoneManager(zoneManager: ZoneManager): void {
+    this.zoneManager = zoneManager;
   }
 
   spawnResource(gridX: number, gridY: number, type: ResourceType): Resource {
@@ -215,19 +265,93 @@ export class ResourceManager {
     return null;
   }
 
-  // Add to stockpile (resource is consumed/hidden)
+  // Add to stockpile - resource moves to a visible pile in a stockpile zone
   addToStockpile(resource: Resource): void {
     const type = resource.resourceType;
     const current = this.stockpileResources.get(type) ?? 0;
     this.stockpileResources.set(type, current + 1);
-    resource.storeInStockpile();
+
+    // Find or create a pile position for this resource
+    const pile = this.findOrCreatePile(type);
+    if (pile) {
+      // Move resource to the pile visually
+      resource.moveToStockpilePile(pile.position, pile.resources.length);
+      pile.resources.push(resource);
+    } else {
+      // No stockpile zone available - hide as fallback
+      resource.storeInStockpile();
+    }
   }
 
-  // Take from stockpile
+  /**
+   * Find an existing pile of the same type with space, or create a new pile
+   */
+  private findOrCreatePile(type: ResourceType): { position: GridPosition; resources: Resource[] } | null {
+    if (!this.zoneManager) return null;
+
+    const stockpiles = this.zoneManager.getZonesByType(ZoneType.Stockpile);
+    if (stockpiles.length === 0) return null;
+
+    const maxPileSize = RESOURCE_CONFIGS[type].stackSize;
+
+    // First pass: find existing pile of same type with space
+    for (const zone of stockpiles) {
+      for (const tile of zone.getTiles()) {
+        const key = `${tile.x},${tile.y}`;
+        const existing = this.stockpilePiles.get(key);
+
+        if (existing && existing.length > 0 && existing.length < maxPileSize) {
+          // Check if same resource type
+          if (existing[0].resourceType === type) {
+            return { position: tile, resources: existing };
+          }
+        }
+      }
+    }
+
+    // Second pass: find empty tile for new pile
+    for (const zone of stockpiles) {
+      for (const tile of zone.getTiles()) {
+        const key = `${tile.x},${tile.y}`;
+        const existing = this.stockpilePiles.get(key);
+
+        if (!existing || existing.length === 0) {
+          // Empty tile - create new pile
+          const newPile: Resource[] = [];
+          this.stockpilePiles.set(key, newPile);
+          return { position: tile, resources: newPile };
+        }
+      }
+    }
+
+    return null; // No space available
+  }
+
+  // Take from stockpile - removes resource from pile and destroys it
   takeFromStockpile(type: ResourceType): boolean {
     const current = this.stockpileResources.get(type) ?? 0;
     if (current > 0) {
       this.stockpileResources.set(type, current - 1);
+
+      // Find and remove an actual resource from piles
+      for (const [key, pile] of this.stockpilePiles.entries()) {
+        if (pile.length > 0 && pile[0].resourceType === type) {
+          const resource = pile.pop();
+          if (resource) {
+            // Remove from resources array and destroy
+            const index = this.resources.indexOf(resource);
+            if (index !== -1) {
+              this.resources.splice(index, 1);
+            }
+            resource.destroy();
+          }
+          // Clean up empty pile entries
+          if (pile.length === 0) {
+            this.stockpilePiles.delete(key);
+          }
+          return true;
+        }
+      }
       return true;
     }
     return false;

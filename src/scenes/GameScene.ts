@@ -10,7 +10,7 @@ import {
 import { IsoMap } from '../world/IsoMap';
 import { getWorldCenter, screenToGridRounded, gridToScreen, GridPosition } from '../world/IsoUtils';
 import { EventBus, GameEvents } from '../utils/EventBus';
-import { Pinata } from '../entities/Pinata';
+import { Pinata, MoodState } from '../entities/Pinata';
 import { PinataSpecies } from '../entities/PinataTypes';
 import { Pathfinder } from '../world/Pathfinding';
 import { ZoneManager, Zone, ZoneType } from '../world/Zone';
@@ -27,6 +27,10 @@ import { FarmingSystem } from '../systems/FarmingSystem';
 import { BuildingSystem } from '../systems/BuildingSystem';
 import { NotificationSystem } from '../systems/NotificationSystem';
 import { WorkSystem } from '../systems/WorkSystem';
+import { PerceptionSystem } from '../systems/PerceptionSystem';
+import { ColonySystem, ColonyMood } from '../systems/ColonySystem';
+import { ResourceNodeSystem } from '../systems/ResourceNodeSystem';
+import { ThreatSystem, ThreatLevel } from '../systems/ThreatSystem';
 
 /**
  * Main game scene - handles world rendering and camera controls
@@ -47,6 +51,10 @@ export class GameScene extends Phaser.Scene {
   private buildingSystem!: BuildingSystem;
   private notificationSystem!: NotificationSystem;
   private workSystem!: WorkSystem;
+  private perceptionSystem!: PerceptionSystem;
+  private colonySystem!: ColonySystem;
+  private resourceNodeSystem!: ResourceNodeSystem;
+  private threatSystem!: ThreatSystem;
   private gameUI!: GameUI;
 
   private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
@@ -75,6 +83,10 @@ export class GameScene extends Phaser.Scene {
   private resourceSpawnTimer = 0;
   private readonly RESOURCE_SPAWN_INTERVAL = 10000; // 10 seconds
 
+  // Passive income from happy piñatas
+  private incomeTimer = 0;
+  private readonly INCOME_INTERVAL = 15000; // Every 15 seconds
+
   // Debug/info display
   private debugText!: Phaser.GameObjects.Text;
   private hoverTileIndicator!: Phaser.GameObjects.Graphics;
@@ -97,6 +109,9 @@ export class GameScene extends Phaser.Scene {
 
     // Create resource manager
     this.resourceManager = new ResourceManager(this);
+
+    // Connect resource manager to zone manager for stockpile visuals
+    this.resourceManager.setZoneManager(this.zoneManager);
 
     // Center camera on world
     const worldCenter = getWorldCenter();
@@ -230,6 +245,35 @@ export class GameScene extends Phaser.Scene {
     );
     this.workSystem.setFarmingSystem(this.farmingSystem);
     this.workSystem.setBuildingSystem(this.buildingSystem);
+    // Note: resourceNodeSystem set after it's created below
+
+    // Create perception system (allows piñatas to notice events)
+    this.perceptionSystem = new PerceptionSystem();
+    this.perceptionSystem.setPinatas(this.pinatas);
+    this.perceptionSystem.setRelationshipSystem(this.relationshipSystem);
+
+    // Create colony system (tracks colony-wide state and pressure)
+    this.colonySystem = new ColonySystem(this.resourceManager);
+    this.colonySystem.setPinatas(this.pinatas);
+    this.colonySystem.setSeasonSystem(this.seasonSystem);
+
+    // Create resource node system (natural resources on the map)
+    this.resourceNodeSystem = new ResourceNodeSystem(
+      this,
+      this.isoMap,
+      this.resourceManager
+    );
+    this.resourceNodeSystem.setSeasonSystem(this.seasonSystem);
+    this.resourceNodeSystem.generateNodes();
+
+    // Connect work system to resource nodes
+    this.workSystem.setResourceNodeSystem(this.resourceNodeSystem);
+
+    // Create threat system (predator raids and night dangers)
+    this.threatSystem = new ThreatSystem(this, this.isoMap, this.pathfinder);
+    this.threatSystem.setPinatas(this.pinatas);
+    this.threatSystem.setTimeSystem(this.timeSystem);
+    this.threatSystem.setColonySystem(this.colonySystem);
 
     // Connect piñatas to all systems
     for (const pinata of this.pinatas) {
@@ -239,13 +283,19 @@ export class GameScene extends Phaser.Scene {
       pinata.setSeasonSystem(this.seasonSystem);
       pinata.setBuildingSystem(this.buildingSystem);
       pinata.setFarmingSystem(this.farmingSystem);
+      pinata.setPerceptionSystem(this.perceptionSystem);
+      pinata.setIsoMap(this.isoMap);
     }
 
-    // Welcome notification
+    // Welcome notifications
     this.notificationSystem.special('Welcome to Piñata Town!', '🎉');
+    this.time.delayedCall(2500, () => {
+      this.notificationSystem.info('[F]eed and [P]et piñatas to earn coins!', '💰');
+    });
 
     console.log('Piñata Town loaded!');
-    console.log('Controls: [Z] Zone | [T] Terraform | [B] Build | [C] Command | [L] Log | [Space] Pause');
+    console.log('Controls: [Z]ones [B]uild [T]erraform [C]ommand [F]eed [P]et | [L] Log | [Space] Pause');
+    console.log('Scroll wheel to zoom, right-click drag to pan.');
     console.log('Seasons cycle every 3 minutes. Prepare for winter!');
   }
 
@@ -332,17 +382,18 @@ export class GameScene extends Phaser.Scene {
       this.togglePause();
     });
 
-    // Mouse wheel zoom
-    this.input.on('wheel', (_pointer: Phaser.Input.Pointer, _gameObjects: unknown[], _deltaX: number, deltaY: number) => {
+    // Mouse wheel zoom - prevent browser scroll
+    this.game.canvas.addEventListener('wheel', (event: WheelEvent) => {
+      event.preventDefault();
       const camera = this.cameras.main;
-      const zoomDelta = deltaY > 0 ? -0.1 : 0.1;
+      const zoomDelta = event.deltaY > 0 ? -0.1 : 0.1;
       const newZoom = Phaser.Math.Clamp(
         camera.zoom + zoomDelta,
         CAMERA_ZOOM_MIN,
         CAMERA_ZOOM_MAX
       );
       camera.setZoom(newZoom);
-    });
+    }, { passive: false });
 
     // Right-click drag to pan
     this.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
@@ -541,11 +592,17 @@ export class GameScene extends Phaser.Scene {
       this.isPaused = false;
     });
 
-    // Handle piñata selection
+    // Handle piñata selection and interactions
     EventBus.on(GameEvents.PINATA_SELECTED, (...args: unknown[]) => {
       const pinata = args[0] as Pinata;
-      if (this.gameUI.getMode() === UIMode.Normal) {
+      const mode = this.gameUI.getMode();
+
+      if (mode === UIMode.Normal) {
         this.selectPinata(pinata);
+      } else if (mode === UIMode.Feed) {
+        this.feedPinata(pinata);
+      } else if (mode === UIMode.Pet) {
+        this.petPinata(pinata);
       }
     });
 
@@ -557,6 +614,79 @@ export class GameScene extends Phaser.Scene {
       pinata.setSeasonSystem(this.seasonSystem);
       pinata.setBuildingSystem(this.buildingSystem);
       pinata.setFarmingSystem(this.farmingSystem);
+      pinata.setPerceptionSystem(this.perceptionSystem);
+      pinata.setIsoMap(this.isoMap);
+      pinata.setPinataList(this.pinatas);
+    });
+
+    // Reward systems - earn coins and score!
+    EventBus.on(GameEvents.PINATA_BORN, () => {
+      this.gameUI.addCoins(20);
+      this.gameUI.addScore(50);
+      this.notificationSystem.special('New baby! +20 coins, +50 points', '👶');
+    });
+
+    EventBus.on(GameEvents.SOUR_PINATA_CURED, () => {
+      this.gameUI.addCoins(30);
+      this.gameUI.addScore(100);
+      this.notificationSystem.special('Sour cured! +30 coins, +100 points', '💚');
+    });
+
+    EventBus.on(GameEvents.SPECIES_ATTRACTED, () => {
+      this.gameUI.addCoins(15);
+      this.gameUI.addScore(75);
+      this.notificationSystem.special('New resident! +15 coins, +75 points', '🏠');
+    });
+
+    EventBus.on(GameEvents.RESOURCE_COLLECTED, () => {
+      this.gameUI.addCoins(1);
+      this.gameUI.addScore(2);
+    });
+
+    EventBus.on(GameEvents.BUILDING_COMPLETE, () => {
+      this.gameUI.addCoins(10);
+      this.gameUI.addScore(30);
+    });
+
+    // Colony events
+    EventBus.on(GameEvents.COLONY_STARVATION, (...args: unknown[]) => {
+      const pinata = args[0] as Pinata;
+      this.notificationSystem.warning(`${pinata.nickname} is starving!`, '💀');
+    });
+
+    // Resource node harvesting
+    EventBus.on(GameEvents.RESOURCE_HARVESTED, () => {
+      this.gameUI.addScore(3);
+    });
+
+    // Threat system events
+    EventBus.on('threat:raidStarting', (...args: unknown[]) => {
+      const { count } = args[0] as { count: number };
+      this.notificationSystem.warning(`Predator raid incoming! ${count} predator(s) spotted!`, '🐺');
+    });
+
+    EventBus.on('threat:predatorSpawned', (...args: unknown[]) => {
+      const predator = args[0] as Pinata;
+      // Wire up the new predator to systems
+      predator.setZoneManager(this.zoneManager);
+      predator.setResourceManager(this.resourceManager);
+    });
+
+    EventBus.on('threat:predatorKilled', () => {
+      this.gameUI.addCoins(25);
+      this.gameUI.addScore(50);
+      this.notificationSystem.success('Predator defeated!', '⚔️');
+    });
+
+    // Relationship drama events
+    EventBus.on('relationship:romance', (...args: unknown[]) => {
+      const [pinataA, pinataB] = args as [Pinata, Pinata];
+      this.notificationSystem.special(`${pinataA.nickname} ❤️ ${pinataB.nickname}`, '💕');
+    });
+
+    EventBus.on('relationship:jealousy', (...args: unknown[]) => {
+      const [jealous, interloper] = args as [Pinata, Pinata, Pinata];
+      this.notificationSystem.warning(`${jealous.nickname} is jealous of ${interloper.nickname}!`, '😤');
     });
   }
 
@@ -605,6 +735,111 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
+  private feedPinata(pinata: Pinata): void {
+    const FEED_COST = 5;
+    const FEED_AMOUNT = 30;
+
+    if (!this.gameUI.spendCoins(FEED_COST)) {
+      this.notificationSystem.warning('Not enough candy coins!');
+      return;
+    }
+
+    // Feed the piñata
+    pinata.feed(FEED_AMOUNT);
+    this.gameUI.addScore(10);
+
+    // Show tasty effect
+    this.createFeedEffect(pinata);
+
+    this.notificationSystem.success(`Fed ${pinata.nickname}!`, '🍬');
+  }
+
+  private petPinata(pinata: Pinata): void {
+    const PET_HAPPINESS = 20;
+    const PET_SOCIAL = 15;
+
+    // Petting is free!
+    pinata.play(PET_HAPPINESS);
+    pinata.boostSocial(PET_SOCIAL);
+    this.gameUI.addScore(5);
+
+    // Show love effect
+    this.createPetEffect(pinata);
+
+    this.notificationSystem.info(`${pinata.nickname} loves you!`, '❤️');
+  }
+
+  private createFeedEffect(pinata: Pinata): void {
+    // Candy burst particles
+    const emojis = ['🍬', '🍭', '🍫', '✨'];
+    for (let i = 0; i < 6; i++) {
+      const emoji = emojis[Math.floor(Math.random() * emojis.length)];
+      const text = this.add.text(
+        pinata.x + (Math.random() - 0.5) * 40,
+        pinata.y - 20,
+        emoji,
+        { fontSize: '16px' }
+      );
+      text.setOrigin(0.5);
+      text.setDepth(2000);
+
+      this.tweens.add({
+        targets: text,
+        x: text.x + (Math.random() - 0.5) * 60,
+        y: text.y - 40 - Math.random() * 30,
+        alpha: 0,
+        scale: 0.5,
+        duration: 800 + Math.random() * 400,
+        ease: 'Power2',
+        onComplete: () => text.destroy(),
+      });
+    }
+
+    // Bounce the piñata
+    this.tweens.add({
+      targets: pinata,
+      scaleX: 1.2,
+      scaleY: 0.8,
+      duration: 100,
+      yoyo: true,
+      repeat: 1,
+    });
+  }
+
+  private createPetEffect(pinata: Pinata): void {
+    // Hearts floating up
+    for (let i = 0; i < 5; i++) {
+      const heart = this.add.text(
+        pinata.x + (Math.random() - 0.5) * 30,
+        pinata.y - 30,
+        '❤️',
+        { fontSize: `${12 + Math.random() * 10}px` }
+      );
+      heart.setOrigin(0.5);
+      heart.setDepth(2000);
+
+      this.tweens.add({
+        targets: heart,
+        y: heart.y - 50 - Math.random() * 30,
+        alpha: 0,
+        duration: 1000 + Math.random() * 500,
+        delay: i * 100,
+        ease: 'Power2',
+        onComplete: () => heart.destroy(),
+      });
+    }
+
+    // Wiggle the piñata happily
+    this.tweens.add({
+      targets: pinata,
+      angle: { from: -5, to: 5 },
+      duration: 80,
+      yoyo: true,
+      repeat: 3,
+      onComplete: () => { pinata.angle = 0; },
+    });
+  }
+
   private togglePause(): void {
     this.isPaused = !this.isPaused;
     if (this.isPaused) {
@@ -651,12 +886,31 @@ export class GameScene extends Phaser.Scene {
       // Update work system (assigns tasks to idle piñatas)
       this.workSystem.update(delta, this.pinatas);
 
+      // Update perception system
+      this.perceptionSystem.update(delta);
+
+      // Update colony system (tracks colony health and pressure)
+      this.colonySystem.update(delta);
+
+      // Update resource nodes (natural resource growth)
+      this.resourceNodeSystem.update(delta);
+
+      // Update threat system (predator raids)
+      this.threatSystem.update(delta);
+
       // Periodically spawn new resources (affected by season)
       this.resourceSpawnTimer += delta;
       const spawnInterval = this.RESOURCE_SPAWN_INTERVAL / this.seasonSystem.getResourceSpawnMultiplier();
       if (this.resourceSpawnTimer >= spawnInterval) {
         this.resourceSpawnTimer = 0;
         this.spawnRandomResource();
+      }
+
+      // Passive income from happy piñatas
+      this.incomeTimer += delta;
+      if (this.incomeTimer >= this.INCOME_INTERVAL) {
+        this.incomeTimer = 0;
+        this.generatePassiveIncome();
       }
     }
 
@@ -668,6 +922,35 @@ export class GameScene extends Phaser.Scene {
 
     // Update info panel
     this.updateInfoPanel();
+  }
+
+  private generatePassiveIncome(): void {
+    // Count happy piñatas
+    let happyCount = 0;
+    let totalHappiness = 0;
+
+    for (const pinata of this.pinatas) {
+      if (!pinata.getIsAlive()) continue;
+      const mood = pinata.getMood();
+      if (mood === MoodState.Happy) {
+        happyCount++;
+        totalHappiness += 3;
+      } else if (mood === MoodState.Content) {
+        totalHappiness += 1;
+      }
+    }
+
+    if (totalHappiness > 0) {
+      const coins = Math.floor(totalHappiness);
+      const score = Math.floor(totalHappiness * 2);
+      this.gameUI.addCoins(coins);
+      this.gameUI.addScore(score);
+
+      // Only show notification if significant
+      if (happyCount >= 2) {
+        this.notificationSystem.info(`Happy garden! +${coins} coins`, '😊');
+      }
+    }
   }
 
   private spawnRandomResource(): void {
@@ -745,14 +1028,47 @@ export class GameScene extends Phaser.Scene {
     const gridPos = screenToGridRounded(worldPoint.x, worldPoint.y);
     const tile = this.isoMap.getTile(gridPos.x, gridPos.y);
     const zone = this.zoneManager.getZoneAt(gridPos);
+    const colonyState = this.colonySystem.getColonyState();
+
+    // Colony mood emoji
+    const moodEmoji: Record<ColonyMood, string> = {
+      [ColonyMood.Thriving]: '🌟',
+      [ColonyMood.Stable]: '😊',
+      [ColonyMood.Worried]: '😟',
+      [ColonyMood.Desperate]: '😰',
+      [ColonyMood.Mourning]: '😢',
+      [ColonyMood.UnderAttack]: '⚔️',
+    };
+
+    const threatLevel = this.threatSystem.getThreatLevel();
+    const threatEmoji: Record<ThreatLevel, string> = {
+      [ThreatLevel.None]: '🕊️',
+      [ThreatLevel.Low]: '⚠️',
+      [ThreatLevel.Medium]: '⚠️⚠️',
+      [ThreatLevel.High]: '🔥',
+      [ThreatLevel.Siege]: '☠️',
+    };
 
     const lines = [
       `Tile: (${gridPos.x}, ${gridPos.y})`,
       `Terrain: ${tile?.terrain ?? 'none'}`,
       zone ? `Zone: ${zone.config.name}` : '',
-      `Pinatas: ${this.pinatas.length}`,
-      `Food in stockpile: ${this.resourceManager.getTotalFood()}`,
-      `Zones: ${this.zoneManager.getAllZones().length}`,
+      ``,
+      `Colony ${moodEmoji[colonyState.mood]} ${colonyState.mood}`,
+      `Population: ${this.colonySystem.getPopulation()}`,
+      `Food: ${this.resourceManager.getTotalFood()} (${Math.round(colonyState.foodSecurity)}% secure)`,
+      threatLevel !== ThreatLevel.None
+        ? `Threat: ${threatEmoji[threatLevel]} ${threatLevel}`
+        : '',
+      this.threatSystem.getActivePredatorCount() > 0
+        ? `Predators: ${this.threatSystem.getActivePredatorCount()}`
+        : '',
+      this.colonySystem.isWinterComing()
+        ? `Winter prep: ${Math.round(colonyState.winterPrepScore)}%`
+        : '',
+      colonyState.fearLevel > 10
+        ? `Fear: ${Math.round(colonyState.fearLevel)}%`
+        : '',
       this.isPaused ? '[PAUSED]' : '',
     ];
 
@@ -771,12 +1087,18 @@ export class GameScene extends Phaser.Scene {
       return '[' + '='.repeat(filled) + '-'.repeat(10 - filled) + ']';
     };
 
+    // Get current goal info
+    const currentGoal = p.getCurrentGoal();
+    const goalInfo = currentGoal
+      ? `${currentGoal.type} (${currentGoal.source})`
+      : 'none';
+
     const lines = [
       `${p.nickname}`,
       `Species: ${p.speciesData.name}`,
       `Traits: ${p.describeTraits()}`,
       `Mood: ${p.getMood()} | Job: ${p.getJob()}`,
-      `State: ${p.getBehavior()}`,
+      `Goal: ${goalInfo}`,
       `Position: (${pos.x}, ${pos.y})`,
       ``,
       `Hunger: ${needBar(needs.hunger)} ${Math.round(needs.hunger)}`,

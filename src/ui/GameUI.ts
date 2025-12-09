@@ -9,6 +9,8 @@ export enum UIMode {
   Build = 'build',
   Terraform = 'terraform',
   Command = 'command',
+  Feed = 'feed',
+  Pet = 'pet',
 }
 
 export enum CommandType {
@@ -36,12 +38,18 @@ export class GameUI {
   private modeText: Phaser.GameObjects.Text;
   private helpText: Phaser.GameObjects.Text;
   private menuContainer: Phaser.GameObjects.Container;
+  private toolbarContainer: Phaser.GameObjects.Container;
+  private scoreText: Phaser.GameObjects.Text;
 
   private currentMode: UIMode = UIMode.Normal;
   private selectedZoneType: ZoneType | null = null;
   private selectedTerrainType: TerrainType | null = null;
   private selectedCommand: CommandType | null = null;
   private selectedBuildingType: BuildingType | null = null;
+
+  // Score system
+  private score = 0;
+  private candyCoins = 50; // Starting currency
 
   // Callbacks
   private onModeChange?: (mode: UIMode, zoneType: ZoneType | null) => void;
@@ -65,12 +73,24 @@ export class GameUI {
     this.modeText.setOrigin(1, 0);
     this.container.add(this.modeText);
 
-    // Help text (bottom center)
-    this.helpText = scene.add.text(scene.cameras.main.width / 2, scene.cameras.main.height - 40, '', {
+    // Score display (top center)
+    this.scoreText = scene.add.text(scene.cameras.main.width / 2, 10, '', {
+      fontSize: '18px',
+      color: '#FFD700',
+      backgroundColor: '#000000cc',
+      padding: { x: 15, y: 8 },
+      fontStyle: 'bold',
+    });
+    this.scoreText.setOrigin(0.5, 0);
+    this.container.add(this.scoreText);
+    this.updateScoreDisplay();
+
+    // Help text (bottom of screen)
+    this.helpText = scene.add.text(scene.cameras.main.width / 2, scene.cameras.main.height - 10, '', {
       fontSize: '14px',
       color: '#ffffff',
-      backgroundColor: '#000000aa',
-      padding: { x: 10, y: 5 },
+      backgroundColor: '#000000cc',
+      padding: { x: 15, y: 8 },
     });
     this.helpText.setOrigin(0.5, 1);
     this.container.add(this.helpText);
@@ -79,10 +99,50 @@ export class GameUI {
     this.menuContainer = scene.add.container(scene.cameras.main.width - 10, 100);
     this.container.add(this.menuContainer);
 
+    // Toolbar container (unused now but kept for compatibility)
+    this.toolbarContainer = scene.add.container(0, 0);
+    this.toolbarContainer.setVisible(false);
+
     // Setup keyboard shortcuts
     this.setupKeyboard();
 
     this.updateDisplay();
+  }
+
+  private updateScoreDisplay(): void {
+    this.scoreText.setText(`🍬 ${this.candyCoins} coins | ⭐ ${this.score} pts`);
+  }
+
+  addScore(points: number): void {
+    this.score += points;
+    this.updateScoreDisplay();
+
+    // Flash effect
+    this.scene.tweens.add({
+      targets: this.scoreText,
+      scaleX: 1.2,
+      scaleY: 1.2,
+      duration: 100,
+      yoyo: true,
+    });
+  }
+
+  addCoins(amount: number): void {
+    this.candyCoins += amount;
+    this.updateScoreDisplay();
+  }
+
+  spendCoins(amount: number): boolean {
+    if (this.candyCoins >= amount) {
+      this.candyCoins -= amount;
+      this.updateScoreDisplay();
+      return true;
+    }
+    return false;
+  }
+
+  getCoins(): number {
+    return this.candyCoins;
   }
 
   private setupKeyboard(): void {
@@ -119,6 +179,24 @@ export class GameUI {
         this.setMode(UIMode.Normal);
       } else {
         this.showBuildMenu();
+      }
+    });
+
+    // F key for feed mode
+    this.scene.input.keyboard!.addKey('F').on('down', () => {
+      if (this.currentMode === UIMode.Feed) {
+        this.setMode(UIMode.Normal);
+      } else {
+        this.setMode(UIMode.Feed);
+      }
+    });
+
+    // P key for pet mode
+    this.scene.input.keyboard!.addKey('P').on('down', () => {
+      if (this.currentMode === UIMode.Pet) {
+        this.setMode(UIMode.Normal);
+      } else {
+        this.setMode(UIMode.Pet);
       }
     });
 
@@ -446,7 +524,7 @@ export class GameUI {
     switch (this.currentMode) {
       case UIMode.Normal:
         this.modeText.setText('');
-        this.helpText.setText('[Z] Zones | [T] Terraform | [C] Commands | [B] Buildings | Click piñatas');
+        this.helpText.setText('[Z]one [B]uild [T]errain [C]ommand [F]eed [P]et | Click piñata to select | Scroll=Zoom RightDrag=Pan');
         break;
       case UIMode.ZoneDesignate:
         const zoneConfig = this.selectedZoneType ? ZONE_CONFIGS[this.selectedZoneType] : null;
@@ -476,6 +554,16 @@ export class GameUI {
         } else {
           this.helpText.setText('Press [B] for menu, 1-9 to select | [ESC] Cancel');
         }
+        break;
+      case UIMode.Feed:
+        this.modeText.setText('🍬 FEED MODE');
+        this.modeText.setBackgroundColor('#ff9900dd');
+        this.helpText.setText('Click a piñata to feed it! (Costs 5 candy coins) | [ESC] Cancel | [F] Exit');
+        break;
+      case UIMode.Pet:
+        this.modeText.setText('❤️ PET MODE');
+        this.modeText.setBackgroundColor('#ff66aadd');
+        this.helpText.setText('Click a piñata to pet it! (+happiness, +affection) | [ESC] Cancel | [P] Exit');
         break;
     }
   }

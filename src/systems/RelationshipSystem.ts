@@ -6,6 +6,7 @@ export enum RelationshipType {
   Acquaintance = 'acquaintance',
   Friend = 'friend',
   BestFriend = 'bestFriend',
+  RomanticPartner = 'romanticPartner',
   Rival = 'rival',
 }
 
@@ -14,6 +15,7 @@ export interface Relationship {
   pinataB: number; // Pinata ID
   affection: number; // -100 to 100
   lastInteraction: number; // timestamp
+  isRomantic: boolean; // Have they mated?
 }
 
 // Affection thresholds
@@ -27,6 +29,7 @@ const SOCIALIZE_GAIN = 5;
 const PROXIMITY_GAIN = 0.5; // Per second nearby
 const FIGHT_LOSS = 20;
 const HELP_GAIN = 10;
+const JEALOUSY_LOSS = 25; // How much jealousy hurts a relationship
 const DECAY_RATE = 0.1; // Per minute toward 0
 
 /**
@@ -79,6 +82,7 @@ export class RelationshipSystem {
         pinataB: Math.max(idA, idB),
         affection: 0,
         lastInteraction: Date.now(),
+        isRomantic: false,
       };
       this.relationships.set(key, rel);
     }
@@ -128,6 +132,12 @@ export class RelationshipSystem {
     const key = this.getKey(idA, idB);
     const rel = this.relationships.get(key);
     if (!rel) return RelationshipType.Stranger;
+
+    // Romantic partners are a special relationship type
+    if (rel.isRomantic && rel.affection >= FRIEND_THRESHOLD) {
+      return RelationshipType.RomanticPartner;
+    }
+
     return this.getRelationshipType(rel.affection);
   }
 
@@ -219,6 +229,71 @@ export class RelationshipSystem {
         }
       }
     }
+  }
+
+  /**
+   * Mark two piñatas as romantic partners after successful mating
+   */
+  setRomanticPartners(idA: number, idB: number): void {
+    const rel = this.getOrCreateRelationship(idA, idB);
+    rel.isRomantic = true;
+    rel.affection = Math.max(rel.affection, BEST_FRIEND_THRESHOLD); // Ensure high affection
+    rel.lastInteraction = Date.now();
+
+    const pinataA = this.pinatas.find(p => p.id === idA);
+    const pinataB = this.pinatas.find(p => p.id === idB);
+    if (pinataA && pinataB) {
+      console.log(`${pinataA.nickname} and ${pinataB.nickname} are now romantic partners!`);
+      EventBus.emit('relationship:romance', pinataA, pinataB);
+    }
+  }
+
+  /**
+   * Get the romantic partner of a piñata (if any)
+   */
+  getRomanticPartner(pinataId: number): Pinata | null {
+    for (const [, rel] of this.relationships) {
+      if (rel.pinataA !== pinataId && rel.pinataB !== pinataId) continue;
+      if (!rel.isRomantic) continue;
+      if (rel.affection < FRIEND_THRESHOLD) continue; // Relationship degraded
+
+      const otherId = rel.pinataA === pinataId ? rel.pinataB : rel.pinataA;
+      const other = this.pinatas.find(p => p.id === otherId);
+      if (other?.getIsAlive()) {
+        return other;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Check if piñata has a romantic partner
+   */
+  hasRomanticPartner(pinataId: number): boolean {
+    return this.getRomanticPartner(pinataId) !== null;
+  }
+
+  /**
+   * Handle jealousy when a third party tries to romance someone's partner
+   * Returns the jealous piñata if jealousy was triggered
+   */
+  triggerJealousy(interloper: Pinata, target: Pinata): Pinata | null {
+    const existingPartner = this.getRomanticPartner(target.id);
+    if (!existingPartner || existingPartner.id === interloper.id) {
+      return null; // No jealousy if no partner or same partner
+    }
+
+    // The existing partner becomes jealous!
+    // Lose affection toward the interloper
+    this.addAffection(existingPartner.id, interloper.id, -JEALOUSY_LOSS);
+
+    // Also slightly damage relationship with partner (trust issues)
+    this.addAffection(existingPartner.id, target.id, -5);
+
+    console.log(`${existingPartner.nickname} is JEALOUS of ${interloper.nickname}!`);
+    EventBus.emit('relationship:jealousy', existingPartner, interloper, target);
+
+    return existingPartner;
   }
 
   // Get social mood modifier for a piñata

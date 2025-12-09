@@ -3,7 +3,9 @@ import { ZoneManager, ZoneType } from '../world/Zone';
 import { ResourceManager } from '../entities/Resource';
 import { FarmingSystem } from './FarmingSystem';
 import { BuildingSystem } from './BuildingSystem';
+import { ResourceNodeSystem } from './ResourceNodeSystem';
 import { GridPosition } from '../world/IsoUtils';
+import { GoalType, GoalSource, createGoal } from './GoalSystem';
 
 /**
  * Work system manages job assignments and work priorities.
@@ -13,6 +15,7 @@ import { GridPosition } from '../world/IsoUtils';
 export enum WorkType {
   Gather = 'gather',           // Collect resources from ground
   Haul = 'haul',               // Move resources to stockpile
+  Harvest = 'harvest',         // Harvest from resource nodes (bushes, flowers)
   Farm = 'farm',               // Tend crops (plant, water, harvest)
   Build = 'build',             // Construct buildings
   Guard = 'guard',             // Patrol and fight threats
@@ -32,6 +35,7 @@ export interface WorkTask {
 export interface WorkPriorities {
   [WorkType.Gather]: number;
   [WorkType.Haul]: number;
+  [WorkType.Harvest]: number;
   [WorkType.Farm]: number;
   [WorkType.Build]: number;
   [WorkType.Guard]: number;
@@ -41,6 +45,7 @@ export interface WorkPriorities {
 const DEFAULT_PRIORITIES: WorkPriorities = {
   [WorkType.Gather]: 5,
   [WorkType.Haul]: 4,
+  [WorkType.Harvest]: 6,  // Higher priority - natural resources are valuable
   [WorkType.Farm]: 6,
   [WorkType.Build]: 3,
   [WorkType.Guard]: 7,
@@ -54,6 +59,7 @@ export class WorkSystem {
   private resourceManager: ResourceManager;
   private farmingSystem: FarmingSystem | null = null;
   private buildingSystem: BuildingSystem | null = null;
+  private resourceNodeSystem: ResourceNodeSystem | null = null;
 
   private tasks: Map<number, WorkTask> = new Map();
   private priorities: WorkPriorities = { ...DEFAULT_PRIORITIES };
@@ -78,6 +84,10 @@ export class WorkSystem {
 
   setBuildingSystem(buildingSystem: BuildingSystem): void {
     this.buildingSystem = buildingSystem;
+  }
+
+  setResourceNodeSystem(resourceNodeSystem: ResourceNodeSystem): void {
+    this.resourceNodeSystem = resourceNodeSystem;
   }
 
   update(delta: number, pinatas: Pinata[]): void {
@@ -154,6 +164,17 @@ export class WorkSystem {
         const existingTask = this.findTaskAt(building.position, WorkType.Build);
         if (!existingTask) {
           this.createTask(WorkType.Build, building.position, { buildingId: building.id });
+        }
+      }
+    }
+
+    // Generate harvest tasks for resource nodes with resources
+    if (this.resourceNodeSystem) {
+      for (const node of this.resourceNodeSystem.getHarvestableNodes()) {
+        const pos = node.getGridPosition();
+        const existingTask = this.findTaskAt(pos, WorkType.Harvest);
+        if (!existingTask) {
+          this.createTask(WorkType.Harvest, pos, { nodeId: node.id });
         }
       }
     }
@@ -241,7 +262,7 @@ export class WorkSystem {
   private jobMatchesWork(job: JobType, workType: WorkType): boolean {
     switch (job) {
       case JobType.Gatherer:
-        return workType === WorkType.Gather || workType === WorkType.Haul;
+        return workType === WorkType.Gather || workType === WorkType.Haul || workType === WorkType.Harvest;
       case JobType.Farmer:
         return workType === WorkType.Farm;
       case JobType.Guard:
@@ -256,9 +277,9 @@ export class WorkSystem {
 
     // Species-specific bonuses
     const bonuses: Record<string, Partial<Record<WorkType, number>>> = {
-      sparrowmint: { [WorkType.Gather]: 10, [WorkType.Haul]: 5 },
+      sparrowmint: { [WorkType.Gather]: 10, [WorkType.Haul]: 5, [WorkType.Harvest]: 8 },
       moozipan: { [WorkType.Farm]: 10 },
-      buzzlegum: { [WorkType.Farm]: 8, [WorkType.Gather]: 5 },
+      buzzlegum: { [WorkType.Farm]: 8, [WorkType.Gather]: 5, [WorkType.Harvest]: 12 }, // Bees love flowers
       rashberry: { [WorkType.Guard]: 15 },
     };
 
@@ -269,11 +290,43 @@ export class WorkSystem {
     task.assignedTo = pinata.id;
     this.pinataAssignments.set(pinata.id, task.id);
 
-    // Tell piñata about the task and send them to work
+    // Create a goal for this work task and add to piñata's goal queue
+    const goalType = this.getGoalTypeForWork(task.type);
+    const workGoal = createGoal(goalType, GoalSource.Assignment, {
+      basePriority: task.priority * 5, // Scale priority
+      targetPosition: task.position,
+      targetResourceId: (task.data as { resourceId?: number })?.resourceId,
+      data: {
+        taskId: task.id,
+        workType: task.type,
+        ...task.data as Record<string, unknown>,
+      },
+    });
+
+    pinata.addGoal(workGoal);
+
+    // Also use legacy system for backwards compatibility
     pinata.assignWorkTask(task.type, task.position, task.data);
     pinata.goToWork(task.position.x, task.position.y);
 
     console.log(`Assigned ${pinata.nickname} to ${task.type} at (${task.position.x}, ${task.position.y})`);
+  }
+
+  private getGoalTypeForWork(workType: WorkType): GoalType {
+    switch (workType) {
+      case WorkType.Gather:
+      case WorkType.Haul:
+      case WorkType.Harvest:
+        return GoalType.GatherResource;
+      case WorkType.Farm:
+        return GoalType.FarmCrop;
+      case WorkType.Build:
+        return GoalType.BuildStructure;
+      case WorkType.Guard:
+        return GoalType.GuardArea;
+      default:
+        return GoalType.Wander;
+    }
   }
 
   completeTask(taskId: number): void {

@@ -60,12 +60,17 @@ export const GameEvents = {
   RELATIONSHIP_CHANGED: 'relationship:changed',
   RESOURCE_SPAWNED: 'resource:spawned',
   RESOURCE_COLLECTED: 'resource:collected',
+  RESOURCE_HARVESTED: 'resource:harvested', // From resource nodes
   BUILDING_PLACED: 'building:placed',
   BUILDING_COMPLETE: 'building:complete',
   SPECIES_ATTRACTED: 'species:attracted',
   ZONE_DESIGNATED: 'zone:designated',
   RANDOM_EVENT_STARTED: 'event:started',
   RANDOM_EVENT_ENDED: 'event:ended',
+  // Colony events
+  COLONY_MOOD_CHANGED: 'colony:moodChanged',
+  COLONY_STARVATION: 'colony:starvation',
+  COLONY_WINTER_WARNING: 'colony:winterWarning',
   GAME_PAUSED: 'game:paused',
   GAME_RESUMED: 'game:resumed',
 } as const;

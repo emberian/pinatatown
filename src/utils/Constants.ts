@@ -52,3 +52,16 @@ export enum TerrainType {
   Water = 'water',
   Flowers = 'flowers',
 }
+
+// Terrain effects - how terrain affects piñata behavior
+export interface TerrainEffect {
+  speedModifier: number;  // 1.0 = normal speed, <1 = slower, >1 = faster
+  moodBonus: number;      // Added to mood calculation while on this terrain
+}
+
+export const TERRAIN_EFFECTS: Record<TerrainType, TerrainEffect> = {
+  [TerrainType.Grass]: { speedModifier: 1.0, moodBonus: 0 },
+  [TerrainType.Dirt]: { speedModifier: 0.85, moodBonus: -0.3 },  // Slower, slightly unpleasant
+  [TerrainType.Water]: { speedModifier: 0, moodBonus: 0 },       // Impassable
+  [TerrainType.Flowers]: { speedModifier: 1.0, moodBonus: 1.0 }, // Happy place!
+};

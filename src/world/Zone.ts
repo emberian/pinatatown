@@ -54,6 +54,9 @@ export class Zone {
   private tiles: GridPosition[] = [];
   private graphics: Phaser.GameObjects.Graphics;
 
+  // Track piñatas currently using this zone
+  private occupants: Set<number> = new Set();
+
   constructor(scene: Phaser.Scene, type: ZoneType) {
     this.id = zoneIdCounter++;
     this.type = type;
@@ -61,6 +64,41 @@ export class Zone {
 
     this.graphics = scene.add.graphics();
     this.graphics.setDepth(5); // Just above terrain
+  }
+
+  /**
+   * Register a piñata as using this zone (e.g., sleeping, playing)
+   */
+  registerOccupant(pinataId: number): void {
+    const wasEmpty = this.occupants.size === 0;
+    this.occupants.add(pinataId);
+    if (wasEmpty) {
+      this.redraw(); // Update visual when first occupant arrives
+    }
+  }
+
+  /**
+   * Unregister a piñata from this zone
+   */
+  unregisterOccupant(pinataId: number): void {
+    this.occupants.delete(pinataId);
+    if (this.occupants.size === 0) {
+      this.redraw(); // Update visual when last occupant leaves
+    }
+  }
+
+  /**
+   * Check if zone has any occupants
+   */
+  isOccupied(): boolean {
+    return this.occupants.size > 0;
+  }
+
+  /**
+   * Get number of current occupants
+   */
+  getOccupantCount(): number {
+    return this.occupants.size;
   }
 
   addTile(pos: GridPosition): void {
@@ -95,11 +133,16 @@ export class Zone {
 
     if (this.tiles.length === 0) return;
 
+    // Brighter alpha when zone is occupied (activity glow)
+    const fillAlpha = this.isOccupied() ? 0.5 : 0.3;
+    const borderAlpha = this.isOccupied() ? 0.9 : 0.6;
+    const borderWidth = this.isOccupied() ? 2 : 1;
+
     // Draw each tile with zone color overlay
     for (const tile of this.tiles) {
       const { x, y } = gridToScreen(tile.x, tile.y);
 
-      this.graphics.fillStyle(this.config.color, 0.3);
+      this.graphics.fillStyle(this.config.color, fillAlpha);
       this.graphics.beginPath();
       this.graphics.moveTo(x, y - 16);
       this.graphics.lineTo(x + 32, y);
@@ -108,8 +151,8 @@ export class Zone {
       this.graphics.closePath();
       this.graphics.fillPath();
 
-      // Border
-      this.graphics.lineStyle(1, this.config.color, 0.6);
+      // Border (thicker when occupied)
+      this.graphics.lineStyle(borderWidth, this.config.color, borderAlpha);
       this.graphics.strokePath();
     }
   }

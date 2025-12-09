@@ -3,6 +3,8 @@ import {
   WORLD_WIDTH,
   WORLD_HEIGHT,
   TerrainType,
+  TerrainEffect,
+  TERRAIN_EFFECTS,
 } from '../utils/Constants';
 import { gridToScreen, getDepth, screenToGridRounded, isValidGridPosition } from './IsoUtils';
 
@@ -99,6 +101,15 @@ export class IsoMap {
   isWalkable(gridX: number, gridY: number): boolean {
     const tile = this.getTile(gridX, gridY);
     return tile ? tile.walkable : false;
+  }
+
+  /**
+   * Get terrain effects at position (speed modifier, mood bonus)
+   */
+  getTerrainEffect(gridX: number, gridY: number): TerrainEffect | null {
+    const tile = this.getTile(gridX, gridY);
+    if (!tile) return null;
+    return TERRAIN_EFFECTS[tile.terrain];
   }
 
   setTerrain(gridX: number, gridY: number, terrain: TerrainType): void {
