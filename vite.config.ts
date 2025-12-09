@@ -1,7 +1,7 @@
 import { defineConfig } from 'vite';
 
 export default defineConfig({
-  base: './',
+  base: process.env.BASE_URL || './',
   build: {
     outDir: 'dist',
     assetsDir: 'assets',
