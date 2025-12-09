@@ -5,13 +5,23 @@ import { Pathfinder } from '../world/Pathfinding';
 import { NEED_MAX, NEED_DECAY_RATE, MOOD_HAPPY_THRESHOLD, MOOD_STRESSED_THRESHOLD, MOOD_BREAKING_THRESHOLD } from '../utils/Constants';
 import { EventBus, GameEvents } from '../utils/EventBus';
 import { ZoneManager, ZoneType } from '../world/Zone';
-import { ResourceManager, RESOURCE_CONFIGS } from './Resource';
+import { ResourceManager, Resource, ResourceType } from './Resource';
+import { TimeSystem } from '../systems/TimeSystem';
+import { RelationshipSystem } from '../systems/RelationshipSystem';
 
 export enum MoodState {
   Happy = 'happy',
   Content = 'content',
   Stressed = 'stressed',
   Breaking = 'breaking',
+}
+
+export enum JobType {
+  Idle = 'idle',
+  Gatherer = 'gatherer',
+  Farmer = 'farmer',
+  Guard = 'guard',
+  Hunter = 'hunter',
 }
 
 export enum BehaviorState {
@@ -24,9 +34,23 @@ export enum BehaviorState {
   Sleeping = 'sleeping',
   SeekingFun = 'seekingFun',
   Playing = 'playing',
+  SeekingSocial = 'seekingSocial',
+  // Gatherer behaviors
+  SeekingResource = 'seekingResource',
+  PickingUpResource = 'pickingUp',
+  CarryingToStockpile = 'carryingToStockpile',
+  DroppingResource = 'droppingResource',
   Working = 'working',
   Socializing = 'socializing',
   MentalBreak = 'mentalBreak',
+  // Predator/prey behaviors
+  Hunting = 'hunting',
+  Chasing = 'chasing',
+  Attacking = 'attacking',
+  Fleeing = 'fleeing',
+  Guarding = 'guarding',
+  Fighting = 'fighting',
+  Dead = 'dead',
 }
 
 export interface PinataNeeds {
@@ -64,6 +88,7 @@ export class Pinata extends Phaser.GameObjects.Container {
   private needs: PinataNeeds;
   private mood: MoodState = MoodState.Content;
   private behavior: BehaviorState = BehaviorState.Idle;
+  private job: JobType = JobType.Idle;
 
   // Movement
   private pathfinder: Pathfinder | null = null;
@@ -73,11 +98,29 @@ export class Pinata extends Phaser.GameObjects.Container {
   // External references (set by GameScene)
   private zoneManager: ZoneManager | null = null;
   private resourceManager: ResourceManager | null = null;
+  private timeSystem: TimeSystem | null = null;
+  private relationshipSystem: RelationshipSystem | null = null;
 
   // Activity state
   private activityTimer = 0;
   private idleTimer = 0;
-  private targetZoneTile: GridPosition | null = null;
+
+  // Gatherer state
+  private carriedResource: Resource | null = null;
+  private targetResource: Resource | null = null;
+
+  // Predator/prey state
+  private targetPrey: Pinata | null = null;
+  private threat: Pinata | null = null;
+  private allPinatas: Pinata[] = [];
+  private isAlive = true;
+  private huntCooldown = 0;
+
+  // Social state
+  private socialTarget: Pinata | null = null;
+
+  // Production state
+  private productionTimer = 0;
 
   // Animation
   private bobTween: Phaser.Tweens.Tween | null = null;
@@ -180,7 +223,44 @@ export class Pinata extends Phaser.GameObjects.Container {
     this.resourceManager = resourceManager;
   }
 
+  setTimeSystem(timeSystem: TimeSystem): void {
+    this.timeSystem = timeSystem;
+  }
+
+  setRelationshipSystem(relationshipSystem: RelationshipSystem): void {
+    this.relationshipSystem = relationshipSystem;
+  }
+
+  setPinataList(pinatas: Pinata[]): void {
+    this.allPinatas = pinatas;
+  }
+
+  isPredator(): boolean {
+    return this.species === PinataSpecies.Pretztail;
+  }
+
+  isGuard(): boolean {
+    return this.species === PinataSpecies.Rashberry || this.job === JobType.Guard;
+  }
+
+  getIsAlive(): boolean {
+    return this.isAlive;
+  }
+
   update(delta: number): void {
+    // Dead piñatas don't update
+    if (!this.isAlive) {
+      return;
+    }
+
+    // Update hunt cooldown
+    if (this.huntCooldown > 0) {
+      this.huntCooldown -= delta;
+    }
+
+    // Check for nearby threats (flee from predators!)
+    this.checkForThreats();
+
     // Decay needs over time
     this.updateNeeds(delta);
 
@@ -190,17 +270,60 @@ export class Pinata extends Phaser.GameObjects.Container {
     // Execute behavior (includes need-seeking AI)
     this.updateBehavior(delta);
 
+    // Handle production (for producers like Moozipan, Buzzlegum)
+    this.updateProduction(delta);
+
     // Update visuals
     this.updateVisuals();
     this.updateStatusIcon();
   }
 
+  private updateProduction(delta: number): void {
+    // Only producer species produce
+    if (!this.speciesData.produces || !this.speciesData.productionTime) return;
+
+    // Need to be well-fed and not stressed to produce
+    if (this.needs.hunger < 40 || this.mood === MoodState.Breaking || this.mood === MoodState.Stressed) {
+      return;
+    }
+
+    // Need resource manager to spawn resources
+    if (!this.resourceManager) return;
+
+    // Update timer
+    this.productionTimer += delta;
+
+    // Happy piñatas produce faster
+    const speedMultiplier = this.mood === MoodState.Happy ? 0.75 : 1;
+    const productionTime = this.speciesData.productionTime * speedMultiplier;
+
+    if (this.productionTimer >= productionTime) {
+      this.productionTimer = 0;
+
+      // Produce resource at current location
+      const resource = this.resourceManager.spawnResource(
+        this.gridX,
+        this.gridY,
+        this.speciesData.produces
+      );
+
+      // Producing costs hunger
+      this.needs.hunger = Math.max(0, this.needs.hunger - 15);
+
+      EventBus.emit(GameEvents.RESOURCE_SPAWNED, this, resource);
+      console.log(`${this.nickname} produced ${this.speciesData.produces}!`);
+    }
+  }
+
   private updateNeeds(delta: number): void {
     const decayRate = NEED_DECAY_RATE * (delta / 1000);
 
+    // Time of day affects rest decay (get sleepier at night)
+    const timeMultiplier = this.timeSystem?.getRestDecayMultiplier() ?? 1.0;
+
     // Different activities affect need decay/gain
     let hungerDecay = decayRate;
-    let restDecay = decayRate;
+    let restDecay = decayRate * timeMultiplier;
     let funDecay = decayRate * 0.8;
     let socialDecay = decayRate * 0.5;
 
@@ -285,6 +408,9 @@ export class Pinata extends Phaser.GameObjects.Container {
       case BehaviorState.SeekingFood:
       case BehaviorState.SeekingSleep:
       case BehaviorState.SeekingFun:
+      case BehaviorState.SeekingSocial:
+      case BehaviorState.SeekingResource:
+      case BehaviorState.CarryingToStockpile:
         this.updateMovement(delta);
         break;
 
@@ -300,8 +426,45 @@ export class Pinata extends Phaser.GameObjects.Container {
         this.handlePlaying(delta);
         break;
 
+      case BehaviorState.Socializing:
+        this.handleSocializing(delta);
+        break;
+
+      case BehaviorState.PickingUpResource:
+        this.handlePickingUp(delta);
+        break;
+
+      case BehaviorState.DroppingResource:
+        this.handleDroppingResource(delta);
+        break;
+
       case BehaviorState.MentalBreak:
         this.handleMentalBreak(delta);
+        break;
+
+      // Predator/prey behaviors
+      case BehaviorState.Hunting:
+        this.handleHunting(delta);
+        break;
+
+      case BehaviorState.Chasing:
+        this.handleChasing(delta);
+        break;
+
+      case BehaviorState.Attacking:
+        this.handleAttacking(delta);
+        break;
+
+      case BehaviorState.Fleeing:
+        this.handleFleeing(delta);
+        break;
+
+      case BehaviorState.Fighting:
+        this.handleFighting(delta);
+        break;
+
+      case BehaviorState.Dead:
+        // Dead piñatas don't do anything
         break;
 
       default:
@@ -312,14 +475,126 @@ export class Pinata extends Phaser.GameObjects.Container {
   private handleIdleBehavior(delta: number): void {
     this.idleTimer += delta;
 
-    // Check if any needs require attention
+    // Predators hunt when hungry and cooldown is done
+    if (this.isPredator() && this.huntCooldown <= 0 && this.needs.hunger < 60) {
+      const prey = this.findPrey();
+      if (prey) {
+        this.targetPrey = prey;
+        this.behavior = BehaviorState.Hunting;
+        return;
+      }
+    }
+
+    // Check if any needs require urgent attention
     if (this.shouldSeekNeed()) {
       return;
+    }
+
+    // Auto-assign job if idle
+    this.autoAssignJob();
+
+    // Do job work
+    if (this.job === JobType.Gatherer) {
+      if (this.tryGatherResource()) {
+        return;
+      }
     }
 
     // After being idle for a bit, start wandering
     if (this.idleTimer > 2000 + Math.random() * 3000) {
       this.startWandering();
+    }
+  }
+
+  private autoAssignJob(): void {
+    // Only auto-assign if currently idle job
+    if (this.job !== JobType.Idle) return;
+
+    // Check if colony needs gatherers (low food in stockpile, resources available)
+    if (this.resourceManager && this.zoneManager) {
+      const foodCount = this.resourceManager.getTotalFood();
+      const hasResources = this.resourceManager.getAvailableResources().length > 0;
+      const hasStockpile = this.zoneManager.getZonesByType(ZoneType.Stockpile).length > 0;
+
+      // Need gatherers if low on food and resources exist
+      if (foodCount < 15 && hasResources && hasStockpile) {
+        // Sparrowmints are best gatherers
+        if (this.species === PinataSpecies.Sparrowmint || Math.random() < 0.3) {
+          this.job = JobType.Gatherer;
+        }
+      }
+    }
+  }
+
+  private tryGatherResource(): boolean {
+    if (!this.resourceManager || !this.zoneManager) return false;
+
+    // Find nearest available resource
+    const resource = this.resourceManager.findNearestResource(
+      { x: this.gridX, y: this.gridY }
+    );
+
+    if (resource) {
+      this.targetResource = resource;
+      const pos = resource.getGridPosition();
+      if (this.moveToGrid(pos.x, pos.y)) {
+        this.behavior = BehaviorState.SeekingResource;
+        return true;
+      }
+    }
+
+    // No resources to gather, go back to idle job
+    this.job = JobType.Idle;
+    return false;
+  }
+
+  private handlePickingUp(delta: number): void {
+    this.activityTimer += delta;
+
+    // Picking up takes 0.5 seconds
+    if (this.activityTimer >= 500) {
+      this.activityTimer = 0;
+
+      if (this.targetResource && this.targetResource.isAvailable()) {
+        this.carriedResource = this.targetResource;
+        this.carriedResource.pickup();
+        this.targetResource = null;
+
+        // Now carry to stockpile
+        if (this.zoneManager) {
+          const stockpile = this.zoneManager.findNearestZone(
+            { x: this.gridX, y: this.gridY },
+            ZoneType.Stockpile
+          );
+          if (stockpile && this.moveToGrid(stockpile.tile.x, stockpile.tile.y)) {
+            this.behavior = BehaviorState.CarryingToStockpile;
+            return;
+          }
+        }
+      }
+
+      // Failed to pick up or no stockpile - go idle
+      this.behavior = BehaviorState.Idle;
+      this.idleTimer = 0;
+    }
+  }
+
+  private handleDroppingResource(delta: number): void {
+    this.activityTimer += delta;
+
+    // Dropping takes 0.3 seconds
+    if (this.activityTimer >= 300) {
+      this.activityTimer = 0;
+
+      if (this.carriedResource && this.resourceManager) {
+        this.resourceManager.addToStockpile(this.carriedResource);
+        EventBus.emit(GameEvents.RESOURCE_COLLECTED, this, this.carriedResource);
+        this.carriedResource = null;
+      }
+
+      // Look for more resources to gather
+      this.behavior = BehaviorState.Idle;
+      this.idleTimer = 0;
     }
   }
 
@@ -333,12 +608,9 @@ export class Pinata extends Phaser.GameObjects.Container {
           { x: this.gridX, y: this.gridY },
           ZoneType.Stockpile
         );
-        if (stockpile) {
-          this.targetZoneTile = stockpile.tile;
-          if (this.moveToGrid(stockpile.tile.x, stockpile.tile.y)) {
-            this.behavior = BehaviorState.SeekingFood;
-            return true;
-          }
+        if (stockpile && this.moveToGrid(stockpile.tile.x, stockpile.tile.y)) {
+          this.behavior = BehaviorState.SeekingFood;
+          return true;
         }
       }
     }
@@ -349,12 +621,9 @@ export class Pinata extends Phaser.GameObjects.Container {
         { x: this.gridX, y: this.gridY },
         ZoneType.Sleep
       );
-      if (sleepZone) {
-        this.targetZoneTile = sleepZone.tile;
-        if (this.moveToGrid(sleepZone.tile.x, sleepZone.tile.y)) {
-          this.behavior = BehaviorState.SeekingSleep;
-          return true;
-        }
+      if (sleepZone && this.moveToGrid(sleepZone.tile.x, sleepZone.tile.y)) {
+        this.behavior = BehaviorState.SeekingSleep;
+        return true;
       }
     }
 
@@ -364,16 +633,63 @@ export class Pinata extends Phaser.GameObjects.Container {
         { x: this.gridX, y: this.gridY },
         ZoneType.Recreation
       );
-      if (funZone) {
-        this.targetZoneTile = funZone.tile;
-        if (this.moveToGrid(funZone.tile.x, funZone.tile.y)) {
-          this.behavior = BehaviorState.SeekingFun;
+      if (funZone && this.moveToGrid(funZone.tile.x, funZone.tile.y)) {
+        this.behavior = BehaviorState.SeekingFun;
+        return true;
+      }
+    }
+
+    // Check social - find someone to talk to
+    if (this.needs.social < NEED_SEEK_THRESHOLD) {
+      const target = this.findSocialTarget();
+      if (target) {
+        const targetPos = target.getGridPosition();
+        if (this.moveToGrid(targetPos.x, targetPos.y)) {
+          this.socialTarget = target;
+          this.behavior = BehaviorState.SeekingSocial;
           return true;
         }
       }
     }
 
     return false;
+  }
+
+  private findSocialTarget(): Pinata | null {
+    // First, prefer friends (from relationship system)
+    if (this.relationshipSystem) {
+      const friends = this.relationshipSystem.getFriends(this.id);
+      if (friends.length > 0) {
+        // Find nearest friend
+        let closest: Pinata | null = null;
+        let closestDist = Infinity;
+        for (const friend of friends) {
+          const dist = this.distanceTo(friend);
+          if (dist < closestDist) {
+            closest = friend;
+            closestDist = dist;
+          }
+        }
+        if (closest) return closest;
+      }
+    }
+
+    // Otherwise find any nearby piñata (not a predator or self)
+    const range = 15;
+    let closest: Pinata | null = null;
+    let closestDist = Infinity;
+
+    for (const other of this.allPinatas) {
+      if (other === this || !other.isAlive || other.isPredator()) continue;
+
+      const dist = this.distanceTo(other);
+      if (dist < range && dist < closestDist) {
+        closest = other;
+        closestDist = dist;
+      }
+    }
+
+    return closest;
   }
 
   private handleEating(delta: number): void {
@@ -430,6 +746,42 @@ export class Pinata extends Phaser.GameObjects.Container {
     }
   }
 
+  private handleSocializing(delta: number): void {
+    this.activityTimer += delta;
+
+    // Each second of socializing
+    if (this.activityTimer >= 1000) {
+      this.activityTimer = 0;
+
+      // Check if social target is still nearby
+      if (this.socialTarget && this.socialTarget.getIsAlive()) {
+        const dist = this.distanceTo(this.socialTarget);
+
+        if (dist <= 3) {
+          // Emit socialized event - builds relationship
+          EventBus.emit(GameEvents.PINATA_SOCIALIZED, this, this.socialTarget);
+
+          // Both piñatas gain social satisfaction
+          const socialGain = 15;
+          this.needs.social = Math.min(NEED_MAX, this.needs.social + socialGain);
+        } else {
+          // Target moved away, chase them
+          const targetPos = this.socialTarget.getGridPosition();
+          this.moveToGrid(targetPos.x, targetPos.y);
+          this.behavior = BehaviorState.SeekingSocial;
+          return;
+        }
+      }
+
+      // Stop socializing if satisfied or target gone
+      if (this.needs.social >= NEED_SATISFIED_THRESHOLD || !this.socialTarget?.getIsAlive()) {
+        this.behavior = BehaviorState.Idle;
+        this.idleTimer = 0;
+        this.socialTarget = null;
+      }
+    }
+  }
+
   private handleMentalBreak(delta: number): void {
     // Wander aimlessly
     this.updateMovement(delta);
@@ -445,6 +797,271 @@ export class Pinata extends Phaser.GameObjects.Container {
       this.behavior = BehaviorState.Idle;
       this.mood = MoodState.Stressed; // Recover to stressed first
     }
+  }
+
+  // ========== Predator/Prey Behaviors ==========
+
+  private checkForThreats(): void {
+    // Predators don't flee
+    if (this.isPredator()) return;
+
+    // Already fleeing or fighting
+    if (this.behavior === BehaviorState.Fleeing || this.behavior === BehaviorState.Fighting) {
+      return;
+    }
+
+    // Find nearby predators
+    const threatRange = 8; // tiles
+    for (const other of this.allPinatas) {
+      if (!other.isPredator() || !other.isAlive) continue;
+
+      const dist = this.distanceTo(other);
+      if (dist < threatRange) {
+        // Found a threat!
+        this.threat = other;
+
+        // Guards fight, others flee
+        if (this.isGuard()) {
+          this.behavior = BehaviorState.Fighting;
+          this.activityTimer = 0;
+        } else {
+          this.startFleeing(other);
+        }
+        return;
+      }
+    }
+  }
+
+  private distanceTo(other: Pinata): number {
+    const otherPos = other.getGridPosition();
+    const dx = this.gridX - otherPos.x;
+    const dy = this.gridY - otherPos.y;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  private startFleeing(predator: Pinata): void {
+    if (!this.pathfinder) return;
+
+    const predatorPos = predator.getGridPosition();
+    // Run away from predator
+    const dx = this.gridX - predatorPos.x;
+    const dy = this.gridY - predatorPos.y;
+    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+
+    // Flee 10 tiles in opposite direction
+    const fleeX = Math.round(this.gridX + (dx / dist) * 10);
+    const fleeY = Math.round(this.gridY + (dy / dist) * 10);
+
+    if (this.moveToGrid(fleeX, fleeY)) {
+      this.behavior = BehaviorState.Fleeing;
+      this.threat = predator;
+    }
+  }
+
+  private handleHunting(delta: number): void {
+    // Find prey if we don't have one
+    if (!this.targetPrey || !this.targetPrey.isAlive) {
+      this.targetPrey = this.findPrey();
+
+      if (!this.targetPrey) {
+        // No prey found, go back to idle
+        this.behavior = BehaviorState.Idle;
+        this.idleTimer = 0;
+        return;
+      }
+    }
+
+    // Move towards prey
+    const preyPos = this.targetPrey.getGridPosition();
+    const dist = this.distanceTo(this.targetPrey);
+
+    if (dist <= 1) {
+      // Close enough to attack!
+      this.behavior = BehaviorState.Attacking;
+      this.activityTimer = 0;
+    } else {
+      // Keep chasing - update path periodically
+      if (this.currentPath.length === 0 || this.pathIndex >= this.currentPath.length) {
+        this.moveToGrid(preyPos.x, preyPos.y);
+        this.behavior = BehaviorState.Chasing;
+      }
+      this.updateMovement(delta);
+    }
+  }
+
+  private handleChasing(delta: number): void {
+    if (!this.targetPrey || !this.targetPrey.isAlive) {
+      this.behavior = BehaviorState.Idle;
+      this.idleTimer = 0;
+      this.targetPrey = null;
+      return;
+    }
+
+    const dist = this.distanceTo(this.targetPrey);
+
+    if (dist <= 1) {
+      // Caught up!
+      this.behavior = BehaviorState.Attacking;
+      this.activityTimer = 0;
+    } else if (dist > 15) {
+      // Prey escaped
+      this.behavior = BehaviorState.Idle;
+      this.idleTimer = 0;
+      this.targetPrey = null;
+    } else {
+      // Update chase path if reached end
+      if (this.pathIndex >= this.currentPath.length) {
+        const preyPos = this.targetPrey.getGridPosition();
+        this.moveToGrid(preyPos.x, preyPos.y);
+      }
+      this.updateMovement(delta);
+    }
+  }
+
+  private handleAttacking(delta: number): void {
+    this.activityTimer += delta;
+
+    // Attack takes 1 second
+    if (this.activityTimer >= 1000) {
+      this.activityTimer = 0;
+
+      if (this.targetPrey && this.targetPrey.isAlive) {
+        const dist = this.distanceTo(this.targetPrey);
+        if (dist <= 2) {
+          // Successful attack!
+          this.targetPrey.takeDamage(this);
+          this.huntCooldown = 30000; // 30 second cooldown after successful hunt
+        }
+      }
+
+      this.targetPrey = null;
+      this.behavior = BehaviorState.Idle;
+      this.idleTimer = 0;
+    }
+  }
+
+  private handleFleeing(delta: number): void {
+    // Keep moving along flee path
+    this.updateMovement(delta);
+
+    // Check if threat is still nearby
+    if (this.threat && this.threat.isAlive) {
+      const dist = this.distanceTo(this.threat);
+
+      if (dist < 5 && this.pathIndex >= this.currentPath.length) {
+        // Still too close, keep fleeing
+        this.startFleeing(this.threat);
+      } else if (dist > 12) {
+        // Escaped!
+        this.behavior = BehaviorState.Idle;
+        this.idleTimer = 0;
+        this.threat = null;
+      }
+    } else {
+      // Threat gone
+      if (this.pathIndex >= this.currentPath.length) {
+        this.behavior = BehaviorState.Idle;
+        this.idleTimer = 0;
+        this.threat = null;
+      }
+    }
+  }
+
+  private handleFighting(delta: number): void {
+    this.activityTimer += delta;
+
+    // Check if threat still nearby
+    if (!this.threat || !this.threat.isAlive) {
+      this.behavior = BehaviorState.Idle;
+      this.idleTimer = 0;
+      this.threat = null;
+      return;
+    }
+
+    const dist = this.distanceTo(this.threat);
+
+    if (dist > 2) {
+      // Move towards threat
+      const threatPos = this.threat.getGridPosition();
+      if (this.pathIndex >= this.currentPath.length) {
+        this.moveToGrid(threatPos.x, threatPos.y);
+      }
+      this.updateMovement(delta);
+    } else if (this.activityTimer >= 1500) {
+      // Fight! Guards have combat bonus
+      this.activityTimer = 0;
+
+      // 60% chance to drive off predator (Rashberry bonus)
+      const success = Math.random() < 0.6;
+      if (success) {
+        // Predator flees!
+        this.threat.forceFlee(this);
+        EventBus.emit(GameEvents.PINATA_DEFENDED, this, this.threat);
+        console.log(`${this.nickname} defended against ${this.threat.nickname}!`);
+      }
+
+      this.behavior = BehaviorState.Idle;
+      this.idleTimer = 0;
+      this.threat = null;
+    }
+  }
+
+  private findPrey(): Pinata | null {
+    const huntRange = 12;
+    let closest: Pinata | null = null;
+    let closestDist = Infinity;
+
+    for (const other of this.allPinatas) {
+      // Don't hunt other predators, guards, or self
+      if (other === this || other.isPredator() || !other.isAlive) continue;
+
+      // Avoid guards if possible
+      if (other.isGuard()) continue;
+
+      const dist = this.distanceTo(other);
+      if (dist < huntRange && dist < closestDist) {
+        closest = other;
+        closestDist = dist;
+      }
+    }
+
+    return closest;
+  }
+
+  forceFlee(from: Pinata): void {
+    this.startFleeing(from);
+    this.huntCooldown = 20000; // Scared off for 20 seconds
+  }
+
+  takeDamage(attacker: Pinata): void {
+    // Piñata is "broken open" - dies
+    this.isAlive = false;
+    this.behavior = BehaviorState.Dead;
+
+    // Visual feedback
+    this.sprite.setTint(0x888888);
+    this.sprite.setAlpha(0.5);
+
+    // Drop candy on death (resources)
+    if (this.resourceManager) {
+      // Spawn some candy at death location
+      for (let i = 0; i < 3; i++) {
+        this.resourceManager.spawnResource(this.gridX, this.gridY, ResourceType.Berry);
+      }
+    }
+
+    EventBus.emit(GameEvents.PINATA_DIED, this, attacker);
+    console.log(`${this.nickname} was caught by ${attacker.nickname}!`);
+
+    // Fade out and destroy after a delay
+    this.scene.time.delayedCall(3000, () => {
+      this.scene.tweens.add({
+        targets: this,
+        alpha: 0,
+        duration: 1000,
+        onComplete: () => this.destroy(),
+      });
+    });
   }
 
   private startWandering(): void {
@@ -540,6 +1157,24 @@ export class Pinata extends Phaser.GameObjects.Container {
         this.activityTimer = 0;
         break;
 
+      case BehaviorState.SeekingSocial:
+        // Start socializing
+        this.behavior = BehaviorState.Socializing;
+        this.activityTimer = 0;
+        break;
+
+      case BehaviorState.SeekingResource:
+        // Start picking up resource
+        this.behavior = BehaviorState.PickingUpResource;
+        this.activityTimer = 0;
+        break;
+
+      case BehaviorState.CarryingToStockpile:
+        // Start dropping resource
+        this.behavior = BehaviorState.DroppingResource;
+        this.activityTimer = 0;
+        break;
+
       case BehaviorState.Wandering:
       case BehaviorState.Moving:
       default:
@@ -547,8 +1182,6 @@ export class Pinata extends Phaser.GameObjects.Container {
         this.idleTimer = 0;
         break;
     }
-
-    this.targetZoneTile = null;
   }
 
   private updateDepth(): void {
@@ -606,20 +1239,46 @@ export class Pinata extends Phaser.GameObjects.Container {
       case BehaviorState.SeekingFun:
         icon = '🎉';
         break;
+      case BehaviorState.SeekingResource:
+      case BehaviorState.PickingUpResource:
+        icon = '📦';
+        break;
+      case BehaviorState.CarryingToStockpile:
+      case BehaviorState.DroppingResource:
+        icon = '📦➡️';
+        break;
       case BehaviorState.Working:
         icon = '⚒️';
         break;
       case BehaviorState.Socializing:
+      case BehaviorState.SeekingSocial:
         icon = '💬';
         break;
       case BehaviorState.MentalBreak:
         icon = '😢';
+        break;
+      case BehaviorState.Hunting:
+      case BehaviorState.Chasing:
+        icon = '🦊';
+        break;
+      case BehaviorState.Attacking:
+        icon = '⚔️';
+        break;
+      case BehaviorState.Fleeing:
+        icon = '😱';
+        break;
+      case BehaviorState.Fighting:
+        icon = '🛡️';
+        break;
+      case BehaviorState.Dead:
+        icon = '💀';
         break;
       default:
         // Show warning icon if a need is critical
         if (this.needs.hunger < 20) icon = '🍎❗';
         else if (this.needs.rest < 20) icon = '😴❗';
         else if (this.needs.fun < 20) icon = '😐';
+        else if (this.needs.social < 20) icon = '😔';
         break;
     }
 
@@ -665,8 +1324,21 @@ export class Pinata extends Phaser.GameObjects.Container {
     return this.behavior;
   }
 
+  getJob(): JobType {
+    return this.job;
+  }
+
   getGridPosition(): GridPosition {
     return { x: this.gridX, y: this.gridY };
+  }
+
+  getProductionProgress(): number | null {
+    if (!this.speciesData.produces || !this.speciesData.productionTime) return null;
+    return Math.min(100, (this.productionTimer / this.speciesData.productionTime) * 100);
+  }
+
+  canProduce(): boolean {
+    return this.speciesData.produces !== undefined;
   }
 
   // Actions
@@ -684,6 +1356,47 @@ export class Pinata extends Phaser.GameObjects.Container {
 
   socialize(): void {
     this.behavior = BehaviorState.Socializing;
+  }
+
+  // Player command methods
+  commandMoveTo(gridX: number, gridY: number): boolean {
+    if (this.moveToGrid(gridX, gridY)) {
+      this.behavior = BehaviorState.Moving;
+      this.job = JobType.Idle; // Clear job when given direct orders
+      console.log(`${this.nickname} moving to (${gridX}, ${gridY})`);
+      return true;
+    }
+    return false;
+  }
+
+  commandPickUp(resource: Resource): boolean {
+    if (!resource.isAvailable()) return false;
+
+    const pos = resource.getGridPosition();
+    if (this.moveToGrid(pos.x, pos.y)) {
+      this.targetResource = resource;
+      this.behavior = BehaviorState.SeekingResource;
+      this.job = JobType.Gatherer;
+      console.log(`${this.nickname} going to pick up resource`);
+      return true;
+    }
+    return false;
+  }
+
+  commandGuard(gridX: number, gridY: number): void {
+    this.job = JobType.Guard;
+    if (this.moveToGrid(gridX, gridY)) {
+      this.behavior = BehaviorState.Moving;
+    }
+    console.log(`${this.nickname} guarding area around (${gridX}, ${gridY})`);
+  }
+
+  commandStay(): void {
+    this.currentPath = [];
+    this.pathIndex = 0;
+    this.behavior = BehaviorState.Idle;
+    this.idleTimer = 0;
+    console.log(`${this.nickname} staying put`);
   }
 
   destroy(): void {

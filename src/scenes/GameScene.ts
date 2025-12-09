@@ -5,6 +5,7 @@ import {
   CAMERA_PAN_SPEED,
   WORLD_WIDTH,
   WORLD_HEIGHT,
+  TerrainType,
 } from '../utils/Constants';
 import { IsoMap } from '../world/IsoMap';
 import { getWorldCenter, screenToGridRounded, gridToScreen, GridPosition } from '../world/IsoUtils';
@@ -12,8 +13,15 @@ import { EventBus, GameEvents } from '../utils/EventBus';
 import { Pinata } from '../entities/Pinata';
 import { PinataSpecies } from '../entities/PinataTypes';
 import { Pathfinder } from '../world/Pathfinding';
-import { ZoneManager, Zone } from '../world/Zone';
-import { GameUI, UIMode } from '../ui/GameUI';
+import { ZoneManager, Zone, ZoneType } from '../world/Zone';
+import { GameUI, UIMode, CommandType } from '../ui/GameUI';
+import { ResourceManager, ResourceType } from '../entities/Resource';
+import { AttractionSystem } from '../systems/AttractionSystem';
+import { TimeSystem } from '../systems/TimeSystem';
+import { RelationshipSystem } from '../systems/RelationshipSystem';
+import { RomanceSystem } from '../systems/RomanceSystem';
+import { SourPinataSystem } from '../systems/SourPinataSystem';
+import { RandomEventSystem } from '../systems/RandomEventSystem';
 
 /**
  * Main game scene - handles world rendering and camera controls
@@ -22,6 +30,13 @@ export class GameScene extends Phaser.Scene {
   private isoMap!: IsoMap;
   private pathfinder!: Pathfinder;
   private zoneManager!: ZoneManager;
+  private resourceManager!: ResourceManager;
+  private attractionSystem!: AttractionSystem;
+  private timeSystem!: TimeSystem;
+  private relationshipSystem!: RelationshipSystem;
+  private romanceSystem!: RomanceSystem;
+  private sourPinataSystem!: SourPinataSystem;
+  private randomEventSystem!: RandomEventSystem;
   private gameUI!: GameUI;
 
   private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
@@ -39,6 +54,16 @@ export class GameScene extends Phaser.Scene {
   private dragStart: GridPosition | null = null;
   private currentZone: Zone | null = null;
   private zonePreview!: Phaser.GameObjects.Graphics;
+
+  // Terraform mode
+  private selectedTerrainType: TerrainType | null = null;
+
+  // Command mode
+  private selectedCommand: CommandType | null = null;
+
+  // Resource spawning
+  private resourceSpawnTimer = 0;
+  private readonly RESOURCE_SPAWN_INTERVAL = 10000; // 10 seconds
 
   // Debug/info display
   private debugText!: Phaser.GameObjects.Text;
@@ -59,6 +84,9 @@ export class GameScene extends Phaser.Scene {
 
     // Create zone manager
     this.zoneManager = new ZoneManager(this);
+
+    // Create resource manager
+    this.resourceManager = new ResourceManager(this);
 
     // Center camera on world
     const worldCenter = getWorldCenter();
@@ -97,10 +125,131 @@ export class GameScene extends Phaser.Scene {
       }
     });
 
+    this.gameUI.onTerrainModeChanged((_mode, terrainType) => {
+      this.selectedTerrainType = terrainType;
+    });
+
+    this.gameUI.onCommandChange((command) => {
+      this.selectedCommand = command;
+    });
+
+    // Create some starting zones for demo
+    this.createStartingZones();
+
+    // Spawn initial resources
+    this.spawnInitialResources();
+
     // Spawn initial piñatas
     this.spawnInitialPinatas();
 
-    console.log('Piñata Town loaded! [Z] Zone mode | [Space] Pause | Click piñatas to select');
+    // Create attraction system (after piñatas exist)
+    this.attractionSystem = new AttractionSystem(
+      this,
+      this.isoMap,
+      this.zoneManager,
+      this.resourceManager,
+      this.pathfinder,
+      this.pinatas
+    );
+
+    // Create time system (day/night cycle)
+    this.timeSystem = new TimeSystem(this);
+
+    // Create relationship system
+    this.relationshipSystem = new RelationshipSystem(this.pinatas);
+
+    // Create romance system (breeding)
+    this.romanceSystem = new RomanceSystem(
+      this,
+      this.pinatas,
+      this.relationshipSystem,
+      this.pathfinder,
+      this.zoneManager,
+      this.resourceManager,
+      this.timeSystem
+    );
+
+    // Create sour piñata system
+    this.sourPinataSystem = new SourPinataSystem(
+      this,
+      this.isoMap,
+      this.resourceManager,
+      this.pathfinder,
+      this.zoneManager,
+      this.pinatas
+    );
+
+    // Create random event system
+    this.randomEventSystem = new RandomEventSystem(
+      this,
+      this.isoMap,
+      this.resourceManager,
+      this.pinatas
+    );
+
+    // Connect piñatas to time system and piñata list (for predator/prey)
+    for (const pinata of this.pinatas) {
+      pinata.setTimeSystem(this.timeSystem);
+      pinata.setPinataList(this.pinatas);
+      pinata.setRelationshipSystem(this.relationshipSystem);
+    }
+
+    console.log('Piñata Town loaded!');
+    console.log('Controls: [Z] Zone mode | [Space] Pause | Click piñatas to select');
+    console.log('Zones created: Stockpile (brown), Sleep (blue), Recreation (pink)');
+    console.log('New species will be attracted based on your garden!');
+  }
+
+  private createStartingZones(): void {
+    // Create a stockpile zone near center
+    const stockpile = this.zoneManager.createZone(ZoneType.Stockpile);
+    for (let x = 14; x <= 17; x++) {
+      for (let y = 14; y <= 16; y++) {
+        if (this.isoMap.isWalkable(x, y)) {
+          stockpile.addTile({ x, y });
+        }
+      }
+    }
+
+    // Create a sleep zone
+    const sleepZone = this.zoneManager.createZone(ZoneType.Sleep);
+    for (let x = 10; x <= 12; x++) {
+      for (let y = 10; y <= 12; y++) {
+        if (this.isoMap.isWalkable(x, y)) {
+          sleepZone.addTile({ x, y });
+        }
+      }
+    }
+
+    // Create a recreation zone
+    const recreationZone = this.zoneManager.createZone(ZoneType.Recreation);
+    for (let x = 18; x <= 21; x++) {
+      for (let y = 10; y <= 12; y++) {
+        if (this.isoMap.isWalkable(x, y)) {
+          recreationZone.addTile({ x, y });
+        }
+      }
+    }
+  }
+
+  private spawnInitialResources(): void {
+    // Add some berries to the stockpile to start
+    for (let i = 0; i < 10; i++) {
+      // Spawn near stockpile and immediately add to stockpile count
+      const resource = this.resourceManager.spawnResource(15, 15, ResourceType.Berry);
+      this.resourceManager.addToStockpile(resource);
+    }
+
+    // Also spawn some berries in the world
+    for (let i = 0; i < 5; i++) {
+      let x: number, y: number;
+      do {
+        x = Math.floor(Math.random() * WORLD_WIDTH);
+        y = Math.floor(Math.random() * WORLD_HEIGHT);
+      } while (!this.isoMap.isWalkable(x, y));
+
+      this.resourceManager.spawnResource(x, y, ResourceType.Berry);
+    }
   }
 
   private setupInput(): void {
@@ -188,15 +337,29 @@ export class GameScene extends Phaser.Scene {
       this.isDragging = true;
       this.dragStart = gridPos;
       this.currentZone.addTile(gridPos);
+    } else if (this.gameUI.getMode() === UIMode.Terraform && this.selectedTerrainType) {
+      // Start terraform drag
+      this.isDragging = true;
+      this.dragStart = gridPos;
+      this.isoMap.setTerrain(gridPos.x, gridPos.y, this.selectedTerrainType);
+    } else if (this.gameUI.getMode() === UIMode.Command && this.selectedCommand && this.selectedPinata) {
+      // Execute command on selected piñata
+      this.executeCommand(gridPos);
     }
     // Normal mode clicks are handled by piñata interactive zones
   }
 
   private handleDrag(pointer: Phaser.Input.Pointer): void {
-    if (!this.dragStart || !this.currentZone) return;
-
     const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
     const gridPos = screenToGridRounded(worldPoint.x, worldPoint.y);
+
+    if (this.gameUI.getMode() === UIMode.Terraform && this.selectedTerrainType) {
+      // Paint terrain as we drag
+      this.isoMap.setTerrain(gridPos.x, gridPos.y, this.selectedTerrainType);
+      return;
+    }
+
+    if (!this.dragStart || !this.currentZone) return;
 
     // Add all tiles in rectangle from dragStart to current position
     const minX = Math.min(this.dragStart.x, gridPos.x);
@@ -224,6 +387,35 @@ export class GameScene extends Phaser.Scene {
     // Zone stays, ready for more additions or exit zone mode
   }
 
+  private executeCommand(gridPos: GridPosition): void {
+    if (!this.selectedPinata || !this.selectedCommand) return;
+
+    switch (this.selectedCommand) {
+      case CommandType.MoveTo:
+        this.selectedPinata.commandMoveTo(gridPos.x, gridPos.y);
+        break;
+
+      case CommandType.PickUp:
+        // Find nearest resource to clicked position
+        const resource = this.resourceManager.findNearestResource(gridPos);
+        if (resource) {
+          this.selectedPinata.commandPickUp(resource);
+        }
+        break;
+
+      case CommandType.Guard:
+        this.selectedPinata.commandGuard(gridPos.x, gridPos.y);
+        break;
+
+      case CommandType.Stay:
+        this.selectedPinata.commandStay();
+        break;
+    }
+
+    // Return to normal mode after command
+    this.gameUI.setMode(UIMode.Normal);
+  }
+
   private setupDebugDisplay(): void {
     this.debugText = this.add.text(10, 10, '', {
       fontSize: '14px',
@@ -248,11 +440,11 @@ export class GameScene extends Phaser.Scene {
     // Background
     const bg = this.add.graphics();
     bg.fillStyle(0x000000, 0.8);
-    bg.fillRoundedRect(0, -150, 250, 140, 8);
+    bg.fillRoundedRect(0, -180, 250, 170, 8);
     this.infoPanel.add(bg);
 
     // Text
-    this.infoPanelText = this.add.text(10, -140, '', {
+    this.infoPanelText = this.add.text(10, -170, '', {
       fontSize: '12px',
       color: '#ffffff',
       lineSpacing: 4,
@@ -281,16 +473,14 @@ export class GameScene extends Phaser.Scene {
   }
 
   private spawnInitialPinatas(): void {
+    // Start with just 3 Sparrowmints (the starter species)
     const species = [
       PinataSpecies.Sparrowmint,
+      PinataSpecies.Sparrowmint,
       PinataSpecies.Moozipan,
-      PinataSpecies.Buzzlegum,
-      PinataSpecies.Rashberry,
-      PinataSpecies.Pretztail,
     ];
 
-    // Spawn 5 piñatas of different species
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < species.length; i++) {
       let gridX: number, gridY: number;
 
       // Find a valid spawn position
@@ -300,6 +490,9 @@ export class GameScene extends Phaser.Scene {
       } while (!this.isoMap.isWalkable(gridX, gridY));
 
       const pinata = new Pinata(this, gridX, gridY, species[i], this.pathfinder);
+      // Connect piñata to zone and resource managers
+      pinata.setZoneManager(this.zoneManager);
+      pinata.setResourceManager(this.resourceManager);
       this.pinatas.push(pinata);
     }
   }
@@ -342,6 +535,31 @@ export class GameScene extends Phaser.Scene {
       for (const pinata of this.pinatas) {
         pinata.update(delta);
       }
+
+      // Update attraction system (checks for new species to attract)
+      this.attractionSystem.update(delta);
+
+      // Update time system (day/night cycle)
+      this.timeSystem.update(delta);
+
+      // Update relationship system
+      this.relationshipSystem.update(delta);
+
+      // Update romance system (breeding)
+      this.romanceSystem.update(delta);
+
+      // Update sour piñata system
+      this.sourPinataSystem.update(delta);
+
+      // Update random event system
+      this.randomEventSystem.update(delta);
+
+      // Periodically spawn new resources
+      this.resourceSpawnTimer += delta;
+      if (this.resourceSpawnTimer >= this.RESOURCE_SPAWN_INTERVAL) {
+        this.resourceSpawnTimer = 0;
+        this.spawnRandomResource();
+      }
     }
 
     // Update hover indicator
@@ -352,6 +570,21 @@ export class GameScene extends Phaser.Scene {
 
     // Update info panel
     this.updateInfoPanel();
+  }
+
+  private spawnRandomResource(): void {
+    // Spawn a berry at a random walkable location
+    let x: number, y: number;
+    let attempts = 0;
+    do {
+      x = Math.floor(Math.random() * WORLD_WIDTH);
+      y = Math.floor(Math.random() * WORLD_HEIGHT);
+      attempts++;
+    } while (!this.isoMap.isWalkable(x, y) && attempts < 50);
+
+    if (attempts < 50) {
+      this.resourceManager.spawnResource(x, y, ResourceType.Berry);
+    }
   }
 
   private handleCameraMovement(): void {
@@ -410,6 +643,7 @@ export class GameScene extends Phaser.Scene {
       `Terrain: ${tile?.terrain ?? 'none'}`,
       zone ? `Zone: ${zone.config.name}` : '',
       `Pinatas: ${this.pinatas.length}`,
+      `Food in stockpile: ${this.resourceManager.getTotalFood()}`,
       `Zones: ${this.zoneManager.getAllZones().length}`,
       this.isPaused ? '[PAUSED]' : '',
     ];
@@ -432,7 +666,7 @@ export class GameScene extends Phaser.Scene {
     const lines = [
       `${p.nickname}`,
       `Species: ${p.speciesData.name}`,
-      `Mood: ${p.getMood()}`,
+      `Mood: ${p.getMood()} | Job: ${p.getJob()}`,
       `State: ${p.getBehavior()}`,
       `Position: (${pos.x}, ${pos.y})`,
       ``,
@@ -441,6 +675,13 @@ export class GameScene extends Phaser.Scene {
       `Fun:    ${needBar(needs.fun)} ${Math.round(needs.fun)}`,
       `Social: ${needBar(needs.social)} ${Math.round(needs.social)}`,
     ];
+
+    // Add production info for producers
+    const progress = p.getProductionProgress();
+    if (progress !== null) {
+      lines.push(``);
+      lines.push(`Production: ${needBar(progress)} ${Math.round(progress)}%`);
+    }
 
     this.infoPanelText.setText(lines.join('\n'));
   }
@@ -455,5 +696,9 @@ export class GameScene extends Phaser.Scene {
 
   getZoneManager(): ZoneManager {
     return this.zoneManager;
+  }
+
+  getResourceManager(): ResourceManager {
+    return this.resourceManager;
   }
 }

@@ -1,4 +1,5 @@
 import { COLORS } from '../utils/Constants';
+import { ResourceType } from './Resource';
 
 export enum PinataSpecies {
   Sparrowmint = 'sparrowmint',
@@ -17,6 +18,8 @@ export interface PinataSpeciesData {
   preferredJob: string;
   specialAbility: string;
   attractedBy: string[];
+  produces?: ResourceType; // What resource this species produces
+  productionTime?: number; // Milliseconds between productions (when happy and fed)
 }
 
 export const SPECIES_DATA: Record<PinataSpecies, PinataSpeciesData> = {
@@ -39,6 +42,8 @@ export const SPECIES_DATA: Record<PinataSpecies, PinataSpeciesData> = {
     preferredJob: 'farm',
     specialAbility: 'Produces candy milk',
     attractedBy: ['flowers', 'water'],
+    produces: ResourceType.CandyMilk,
+    productionTime: 30000, // 30 seconds
   },
   [PinataSpecies.Buzzlegum]: {
     species: PinataSpecies.Buzzlegum,
@@ -49,6 +54,8 @@ export const SPECIES_DATA: Record<PinataSpecies, PinataSpeciesData> = {
     preferredJob: 'farm',
     specialAbility: 'Produces honey',
     attractedBy: ['flowers'],
+    produces: ResourceType.Honey,
+    productionTime: 25000, // 25 seconds
   },
   [PinataSpecies.Rashberry]: {
     species: PinataSpecies.Rashberry,
