@@ -479,4 +479,58 @@ export class AttractionSystem {
     const visitor = this.visitors.find(v => v.pinata.id === pinataId);
     return visitor ? visitor.satisfaction : null;
   }
+
+  /**
+   * Get status of all species for UI display
+   */
+  getSpeciesStatuses(): Array<{
+    species: PinataSpecies;
+    count: number;
+    isResident: boolean;
+    attractionProgress: number;
+    requirementsMet: boolean;
+    requirements: string[];
+  }> {
+    const statuses = [];
+
+    for (const species of Object.values(PinataSpecies)) {
+      // Count residents
+      const residents = this.pinatas.filter(
+        p => p.species === species && !this.isVisitor(p.id) && p.getIsAlive()
+      );
+      const count = residents.length;
+
+      // Check if has any residents
+      const isResident = count > 0;
+
+      // Check requirements
+      const requirementsMet = this.meetsRequirements(species);
+
+      // Get visitor progress if being attracted
+      const visitor = this.visitors.find(v => v.species === species);
+      let attractionProgress = 0;
+      if (isResident) {
+        attractionProgress = 100;
+      } else if (visitor) {
+        attractionProgress = visitor.satisfaction;
+      } else if (requirementsMet) {
+        attractionProgress = 50; // Ready to attract
+      }
+
+      // Get unmet requirements
+      const progress = this.getAttractionProgress(species);
+      const requirements = progress.unmet;
+
+      statuses.push({
+        species,
+        count,
+        isResident,
+        attractionProgress,
+        requirementsMet,
+        requirements,
+      });
+    }
+
+    return statuses;
+  }
 }

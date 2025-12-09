@@ -145,6 +145,10 @@ export class GameUI {
     return this.candyCoins;
   }
 
+  getScore(): number {
+    return this.score;
+  }
+
   private setupKeyboard(): void {
     // Z key for zone mode
     this.scene.input.keyboard!.addKey('Z').on('down', () => {

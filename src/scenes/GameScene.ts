@@ -32,6 +32,8 @@ import { ColonySystem, ColonyMood } from '../systems/ColonySystem';
 import { ResourceNodeSystem } from '../systems/ResourceNodeSystem';
 import { ThreatSystem, ThreatLevel } from '../systems/ThreatSystem';
 import { ChallengeSystem, ChallengeEvents } from '../systems/ChallengeSystem';
+import { GameHUD } from '../ui/GameHUD';
+import { SpeciesStatus } from '../ui/SpeciesPanel';
 
 /**
  * Main game scene - handles world rendering and camera controls
@@ -58,6 +60,7 @@ export class GameScene extends Phaser.Scene {
   private threatSystem!: ThreatSystem;
   private challengeSystem!: ChallengeSystem;
   private gameUI!: GameUI;
+  private gameHUD!: GameHUD;
 
   // Game state
   private isGameOver = false;
@@ -320,6 +323,14 @@ export class GameScene extends Phaser.Scene {
       pinata.setPerceptionSystem(this.perceptionSystem);
       pinata.setIsoMap(this.isoMap);
     }
+
+    // Create the new visual HUD
+    this.gameHUD = new GameHUD(this);
+
+    // Handle window resize
+    this.scale.on('resize', (gameSize: Phaser.Structs.Size) => {
+      this.gameHUD.resize(gameSize.width, gameSize.height);
+    });
 
     // Welcome notifications
     this.notificationSystem.special('Welcome to Piñata Town!', '🎉');
@@ -983,6 +994,72 @@ export class GameScene extends Phaser.Scene {
 
     // Update info panel
     this.updateInfoPanel();
+
+    // Update the visual HUD
+    this.updateGameHUD();
+  }
+
+  private updateGameHUD(): void {
+    const alivePinatas = this.pinatas.filter(p => p.getIsAlive() && !p.isPredator());
+
+    // Count piñatas by mood
+    const moodCounts = new Map<MoodState, number>();
+    for (const mood of Object.values(MoodState)) {
+      moodCounts.set(mood, 0);
+    }
+    for (const pinata of alivePinatas) {
+      const mood = pinata.getMood();
+      moodCounts.set(mood, (moodCounts.get(mood) ?? 0) + 1);
+    }
+
+    // Get resources
+    const resources = new Map<ResourceType, number>();
+    for (const type of Object.values(ResourceType)) {
+      resources.set(type, this.resourceManager.getStockpileCount(type));
+    }
+
+    // Get species statuses
+    const attractionStatuses = this.attractionSystem.getSpeciesStatuses();
+    const speciesStatuses: SpeciesStatus[] = attractionStatuses.map(s => ({
+      species: s.species,
+      count: s.count,
+      isResident: s.isResident,
+      attractionProgress: s.attractionProgress,
+      requirementsMet: s.requirementsMet,
+      requirements: s.requirements,
+    }));
+
+    // Get colony state
+    const colonyState = this.colonySystem.getColonyState();
+
+    this.gameHUD.update({
+      // Status bar
+      coins: this.gameUI.getCoins(),
+      score: this.gameUI.getScore(),
+      resources,
+      population: alivePinatas.length,
+      isPaused: this.isPaused,
+      isGameOver: this.isGameOver,
+      isVictory: this.isVictory,
+
+      // Colony panel
+      moodCounts,
+      storageCap: this.resourceManager.getStorageCap(),
+      foodSecurity: colonyState.foodSecurity,
+      season: this.seasonSystem.getSeason(),
+      seasonProgress: this.seasonSystem.getSeasonProgress() * 100,
+      isNight: this.timeSystem.isNight(),
+      threatLevel: this.threatSystem.getThreatLevel(),
+      activePredators: this.threatSystem.getActivePredatorCount(),
+      title: this.challengeSystem.getCurrentTitle(),
+      challengePercent: this.challengeSystem.getCompletionPercent(),
+
+      // Species panel
+      speciesStatuses,
+
+      // Challenge panel
+      challenges: this.challengeSystem.getChallenges(),
+    });
   }
 
   private generatePassiveIncome(): void {
