@@ -339,6 +339,9 @@ export class AttractionSystem {
     pinata.setPinataList(this.pinatas); // For predator/prey detection
     this.pinatas.push(pinata);
 
+    // Emit event so GameScene connects all systems
+    EventBus.emit(GameEvents.PINATA_CREATED, pinata);
+
     // Create visitor tracking
     const visitor: Visitor = {
       pinata,

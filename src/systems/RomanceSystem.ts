@@ -200,6 +200,9 @@ export class RomanceSystem {
     // Add to pinata list
     this.pinatas.push(baby);
 
+    // Emit event so GameScene connects all systems
+    EventBus.emit(GameEvents.PINATA_CREATED, baby);
+
     // Baby starts with relationship to parents
     this.relationshipSystem.addAffection(baby.id, pinataA.id, 50);
     this.relationshipSystem.addAffection(baby.id, pinataB.id, 50);

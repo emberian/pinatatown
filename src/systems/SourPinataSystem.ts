@@ -156,6 +156,9 @@ export class SourPinataSystem {
     pinata.setPinataList(this.pinatas);
     this.pinatas.push(pinata);
 
+    // Emit event so GameScene connects all systems
+    EventBus.emit(GameEvents.PINATA_CREATED, pinata);
+
     // Mark as sour
     const sour: SourPinata = {
       pinata,

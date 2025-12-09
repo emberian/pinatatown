@@ -1,6 +1,7 @@
 import Phaser from 'phaser';
 import { ZoneType, ZONE_CONFIGS } from '../world/Zone';
 import { TerrainType } from '../utils/Constants';
+import { BuildingType, BUILDING_DATA } from '../systems/BuildingSystem';
 
 export enum UIMode {
   Normal = 'normal',
@@ -40,11 +41,13 @@ export class GameUI {
   private selectedZoneType: ZoneType | null = null;
   private selectedTerrainType: TerrainType | null = null;
   private selectedCommand: CommandType | null = null;
+  private selectedBuildingType: BuildingType | null = null;
 
   // Callbacks
   private onModeChange?: (mode: UIMode, zoneType: ZoneType | null) => void;
   private onTerrainModeChange?: (mode: UIMode, terrainType: TerrainType | null) => void;
   private onCommandSelected?: (command: CommandType | null) => void;
+  private onBuildingSelected?: (buildingType: BuildingType | null) => void;
 
   constructor(scene: Phaser.Scene) {
     this.scene = scene;
@@ -110,14 +113,31 @@ export class GameUI {
       }
     });
 
+    // B key for build mode
+    this.scene.input.keyboard!.addKey('B').on('down', () => {
+      if (this.currentMode === UIMode.Build) {
+        this.setMode(UIMode.Normal);
+      } else {
+        this.showBuildMenu();
+      }
+    });
+
     // ESC to cancel
     this.scene.input.keyboard!.addKey('ESC').on('down', () => {
       this.setMode(UIMode.Normal);
     });
 
-    // Number keys for zone/terrain/command types
+    // Number keys for zone/terrain/command/building types
+    const buildingKeys: BuildingType[] = [
+      BuildingType.Fence, BuildingType.CandyHouse, BuildingType.Playground,
+      BuildingType.Granary, BuildingType.WaterWell, BuildingType.Watchtower,
+      BuildingType.Workshop, BuildingType.HoneyPot, BuildingType.Shrine,
+    ];
+
     this.scene.input.keyboard!.addKey('ONE').on('down', () => {
-      if (this.currentMode === UIMode.Command) {
+      if (this.currentMode === UIMode.Build) {
+        this.selectBuildingType(buildingKeys[0]);
+      } else if (this.currentMode === UIMode.Command) {
         this.selectCommand(CommandType.MoveTo);
       } else if (this.currentMode === UIMode.Terraform) {
         this.selectTerrainType(TerrainType.Grass);
@@ -126,7 +146,9 @@ export class GameUI {
       }
     });
     this.scene.input.keyboard!.addKey('TWO').on('down', () => {
-      if (this.currentMode === UIMode.Command) {
+      if (this.currentMode === UIMode.Build) {
+        this.selectBuildingType(buildingKeys[1]);
+      } else if (this.currentMode === UIMode.Command) {
         this.selectCommand(CommandType.PickUp);
       } else if (this.currentMode === UIMode.Terraform) {
         this.selectTerrainType(TerrainType.Dirt);
@@ -135,7 +157,9 @@ export class GameUI {
       }
     });
     this.scene.input.keyboard!.addKey('THREE').on('down', () => {
-      if (this.currentMode === UIMode.Command) {
+      if (this.currentMode === UIMode.Build) {
+        this.selectBuildingType(buildingKeys[2]);
+      } else if (this.currentMode === UIMode.Command) {
         this.selectCommand(CommandType.Guard);
       } else if (this.currentMode === UIMode.Terraform) {
         this.selectTerrainType(TerrainType.Water);
@@ -144,12 +168,39 @@ export class GameUI {
       }
     });
     this.scene.input.keyboard!.addKey('FOUR').on('down', () => {
-      if (this.currentMode === UIMode.Command) {
+      if (this.currentMode === UIMode.Build) {
+        this.selectBuildingType(buildingKeys[3]);
+      } else if (this.currentMode === UIMode.Command) {
         this.selectCommand(CommandType.Stay);
       } else if (this.currentMode === UIMode.Terraform) {
         this.selectTerrainType(TerrainType.Flowers);
       } else if (this.currentMode === UIMode.ZoneDesignate || this.menuContainer.visible) {
         this.selectZoneType(ZoneType.Garden);
+      }
+    });
+    this.scene.input.keyboard!.addKey('FIVE').on('down', () => {
+      if (this.currentMode === UIMode.Build) {
+        this.selectBuildingType(buildingKeys[4]);
+      }
+    });
+    this.scene.input.keyboard!.addKey('SIX').on('down', () => {
+      if (this.currentMode === UIMode.Build) {
+        this.selectBuildingType(buildingKeys[5]);
+      }
+    });
+    this.scene.input.keyboard!.addKey('SEVEN').on('down', () => {
+      if (this.currentMode === UIMode.Build) {
+        this.selectBuildingType(buildingKeys[6]);
+      }
+    });
+    this.scene.input.keyboard!.addKey('EIGHT').on('down', () => {
+      if (this.currentMode === UIMode.Build) {
+        this.selectBuildingType(buildingKeys[7]);
+      }
+    });
+    this.scene.input.keyboard!.addKey('NINE').on('down', () => {
+      if (this.currentMode === UIMode.Build) {
+        this.selectBuildingType(buildingKeys[8]);
       }
     });
   }
@@ -280,12 +331,62 @@ export class GameUI {
     this.onCommandSelected?.(type);
   }
 
+  showBuildMenu(): void {
+    this.menuContainer.removeAll(true);
+
+    const bg = this.scene.add.graphics();
+    bg.fillStyle(0x222222, 0.9);
+    bg.fillRoundedRect(-200, 0, 190, 240, 8);
+    this.menuContainer.add(bg);
+
+    const title = this.scene.add.text(-190, 10, 'Buildings [B]:', {
+      fontSize: '14px',
+      color: '#ffffff',
+      fontStyle: 'bold',
+    });
+    this.menuContainer.add(title);
+
+    // Show first 9 buildings with number keys
+    const buildings = [
+      { type: BuildingType.Fence, key: '1' },
+      { type: BuildingType.CandyHouse, key: '2' },
+      { type: BuildingType.Playground, key: '3' },
+      { type: BuildingType.Granary, key: '4' },
+      { type: BuildingType.WaterWell, key: '5' },
+      { type: BuildingType.Watchtower, key: '6' },
+      { type: BuildingType.Workshop, key: '7' },
+      { type: BuildingType.HoneyPot, key: '8' },
+      { type: BuildingType.Shrine, key: '9' },
+    ];
+
+    buildings.forEach((b, i) => {
+      const data = BUILDING_DATA[b.type];
+      const text = this.scene.add.text(-190, 35 + i * 22, `[${b.key}] ${data.icon} ${data.name}`, {
+        fontSize: '11px',
+        color: '#' + data.color.toString(16).padStart(6, '0'),
+      });
+      this.menuContainer.add(text);
+    });
+
+    this.menuContainer.setVisible(true);
+    this.currentMode = UIMode.Build;
+    this.helpText.setText('Press 1-9 to select building, click to place | [ESC] Cancel');
+  }
+
+  selectBuildingType(type: BuildingType): void {
+    this.selectedBuildingType = type;
+    this.setMode(UIMode.Build);
+    this.menuContainer.setVisible(false);
+    this.onBuildingSelected?.(type);
+  }
+
   setMode(mode: UIMode): void {
     this.currentMode = mode;
     if (mode === UIMode.Normal) {
       this.selectedZoneType = null;
       this.selectedTerrainType = null;
       this.selectedCommand = null;
+      this.selectedBuildingType = null;
       this.menuContainer.setVisible(false);
     }
     this.updateDisplay();
@@ -293,6 +394,7 @@ export class GameUI {
     if (mode === UIMode.Normal) {
       this.onTerrainModeChange?.(mode, null);
       this.onCommandSelected?.(null);
+      this.onBuildingSelected?.(null);
     }
   }
 
@@ -324,6 +426,14 @@ export class GameUI {
     this.onCommandSelected = callback;
   }
 
+  getSelectedBuildingType(): BuildingType | null {
+    return this.selectedBuildingType;
+  }
+
+  onBuildingChange(callback: (buildingType: BuildingType | null) => void): void {
+    this.onBuildingSelected = callback;
+  }
+
   private updateDisplay(): void {
     const commandNames: Record<CommandType, string> = {
       [CommandType.MoveTo]: 'Move To',
@@ -336,7 +446,7 @@ export class GameUI {
     switch (this.currentMode) {
       case UIMode.Normal:
         this.modeText.setText('');
-        this.helpText.setText('[Z] Zones | [T] Terraform | [C] Commands | Click piñatas');
+        this.helpText.setText('[Z] Zones | [T] Terraform | [C] Commands | [B] Buildings | Click piñatas');
         break;
       case UIMode.ZoneDesignate:
         const zoneConfig = this.selectedZoneType ? ZONE_CONFIGS[this.selectedZoneType] : null;
@@ -357,8 +467,15 @@ export class GameUI {
         this.helpText.setText('Click target location/object | [ESC] Cancel | [C] Exit');
         break;
       case UIMode.Build:
-        this.modeText.setText('BUILD MODE');
-        this.helpText.setText('Click to place building | [ESC] Cancel');
+        const buildingData = this.selectedBuildingType ? BUILDING_DATA[this.selectedBuildingType] : null;
+        this.modeText.setText(`BUILD: ${buildingData?.name ?? 'Select type'}`);
+        this.modeText.setBackgroundColor('#' + (buildingData?.color ?? 0x333333).toString(16).padStart(6, '0') + 'dd');
+        if (buildingData) {
+          const costStr = buildingData.cost.map(c => `${c.amount} ${c.type}`).join(', ');
+          this.helpText.setText(`${buildingData.icon} ${buildingData.description} | Cost: ${costStr} | [ESC] Cancel`);
+        } else {
+          this.helpText.setText('Press [B] for menu, 1-9 to select | [ESC] Cancel');
+        }
         break;
     }
   }

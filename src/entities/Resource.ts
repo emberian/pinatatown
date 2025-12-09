@@ -276,4 +276,8 @@ export class ResourceManager {
   getAvailableResources(): Resource[] {
     return this.resources.filter(r => r.isAvailable());
   }
+
+  findResourceById(id: number): Resource | null {
+    return this.resources.find(r => r.id === id) ?? null;
+  }
 }

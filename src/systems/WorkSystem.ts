@@ -269,10 +269,9 @@ export class WorkSystem {
     task.assignedTo = pinata.id;
     this.pinataAssignments.set(pinata.id, task.id);
 
-    // Tell piñata to go do the work
-    // This is a simplified version - in full implementation,
-    // the piñata would have more complex work behaviors
-    pinata.commandMoveTo(task.position.x, task.position.y);
+    // Tell piñata about the task and send them to work
+    pinata.assignWorkTask(task.type, task.position, task.data);
+    pinata.goToWork(task.position.x, task.position.y);
 
     console.log(`Assigned ${pinata.nickname} to ${task.type} at (${task.position.x}, ${task.position.y})`);
   }

@@ -10,6 +10,8 @@ import { TimeSystem } from '../systems/TimeSystem';
 import { RelationshipSystem } from '../systems/RelationshipSystem';
 import { Trait, TraitEffects, generateTraits, getCombinedEffects, TRAIT_INFO, describeTraits } from '../systems/TraitSystem';
 import { SeasonSystem } from '../systems/SeasonSystem';
+import { BuildingSystem } from '../systems/BuildingSystem';
+import { FarmingSystem, CropStage } from '../systems/FarmingSystem';
 
 export enum MoodState {
   Happy = 'happy',
@@ -53,6 +55,10 @@ export enum BehaviorState {
   Guarding = 'guarding',
   Fighting = 'fighting',
   Dead = 'dead',
+  // Work task behaviors
+  GoingToWork = 'goingToWork',
+  Farming = 'farming',
+  Building = 'building',
 }
 
 export interface PinataNeeds {
@@ -108,6 +114,11 @@ export class Pinata extends Phaser.GameObjects.Container {
   private timeSystem: TimeSystem | null = null;
   private relationshipSystem: RelationshipSystem | null = null;
   private seasonSystem: SeasonSystem | null = null;
+  private buildingSystem: BuildingSystem | null = null;
+  private farmingSystem: FarmingSystem | null = null;
+
+  // Work task (assigned by WorkSystem)
+  private currentWorkTask: { type: string; data: unknown; position: GridPosition } | null = null;
 
   // Activity state
   private activityTimer = 0;
@@ -254,6 +265,32 @@ export class Pinata extends Phaser.GameObjects.Container {
 
   setSeasonSystem(seasonSystem: SeasonSystem): void {
     this.seasonSystem = seasonSystem;
+  }
+
+  setBuildingSystem(buildingSystem: BuildingSystem): void {
+    this.buildingSystem = buildingSystem;
+  }
+
+  setFarmingSystem(farmingSystem: FarmingSystem): void {
+    this.farmingSystem = farmingSystem;
+  }
+
+  // Called by WorkSystem to assign a task
+  assignWorkTask(type: string, position: GridPosition, data: unknown): void {
+    this.currentWorkTask = { type, position, data };
+  }
+
+  // Called by WorkSystem to send piñata to work location
+  goToWork(gridX: number, gridY: number): boolean {
+    if (this.moveToGrid(gridX, gridY)) {
+      this.behavior = BehaviorState.GoingToWork;
+      return true;
+    }
+    return false;
+  }
+
+  clearWorkTask(): void {
+    this.currentWorkTask = null;
   }
 
   getTraits(): Trait[] {
@@ -514,6 +551,19 @@ export class Pinata extends Phaser.GameObjects.Container {
         // Dead piñatas don't do anything
         break;
 
+      // Work task behaviors
+      case BehaviorState.GoingToWork:
+        this.updateMovement(delta);
+        break;
+
+      case BehaviorState.Farming:
+        this.handleFarmingWork(delta);
+        break;
+
+      case BehaviorState.Building:
+        this.handleBuildingWork(delta);
+        break;
+
       default:
         break;
     }
@@ -770,6 +820,17 @@ export class Pinata extends Phaser.GameObjects.Container {
     if (this.activityTimer >= 1000) {
       this.activityTimer = 0;
 
+      // Apply building rest bonus (Candy House)
+      let restGain = 8; // Base rest per second
+      if (this.buildingSystem) {
+        const effects = this.buildingSystem.getEffectsAt({ x: this.gridX, y: this.gridY });
+        if (effects.restBonus) {
+          restGain *= effects.restBonus;
+        }
+      }
+
+      this.needs.rest = Math.min(NEED_MAX, this.needs.rest + restGain);
+
       // Wake up if rested enough
       if (this.needs.rest >= NEED_SATISFIED_THRESHOLD) {
         this.behavior = BehaviorState.Idle;
@@ -784,6 +845,17 @@ export class Pinata extends Phaser.GameObjects.Container {
     // Check every second if we should stop playing
     if (this.activityTimer >= 1000) {
       this.activityTimer = 0;
+
+      // Apply building fun bonus (Playground)
+      let funGain = 6; // Base fun per second
+      if (this.buildingSystem) {
+        const effects = this.buildingSystem.getEffectsAt({ x: this.gridX, y: this.gridY });
+        if (effects.funBonus) {
+          funGain *= effects.funBonus;
+        }
+      }
+
+      this.needs.fun = Math.min(NEED_MAX, this.needs.fun + funGain);
 
       // Stop playing if fun is satisfied
       if (this.needs.fun >= NEED_SATISFIED_THRESHOLD) {
@@ -844,6 +916,85 @@ export class Pinata extends Phaser.GameObjects.Container {
       this.behavior = BehaviorState.Idle;
       this.mood = MoodState.Stressed; // Recover to stressed first
     }
+  }
+
+  // ========== Work Task Behaviors ==========
+
+  private handleFarmingWork(delta: number): void {
+    this.activityTimer += delta;
+
+    if (!this.currentWorkTask || !this.farmingSystem) {
+      this.finishWorkTask();
+      return;
+    }
+
+    const taskData = this.currentWorkTask.data as { action: string; cropId: number };
+    const crop = this.farmingSystem.getCropAt(this.currentWorkTask.position);
+
+    if (!crop) {
+      // Crop was harvested/withered already
+      this.finishWorkTask();
+      return;
+    }
+
+    // Farming takes 2 seconds per action
+    if (this.activityTimer >= 2000) {
+      this.activityTimer = 0;
+
+      if (taskData.action === 'harvest' && crop.stage === CropStage.Mature) {
+        this.farmingSystem.harvest(crop);
+        console.log(`${this.nickname} harvested crop!`);
+        EventBus.emit(GameEvents.RESOURCE_COLLECTED, this, { resourceType: 'crop' });
+      } else if (taskData.action === 'water' && crop.needsWater) {
+        this.farmingSystem.waterCrop(crop);
+        console.log(`${this.nickname} watered crop!`);
+      }
+
+      this.finishWorkTask();
+    }
+  }
+
+  private handleBuildingWork(delta: number): void {
+    this.activityTimer += delta;
+
+    if (!this.currentWorkTask || !this.buildingSystem) {
+      this.finishWorkTask();
+      return;
+    }
+
+    const building = this.buildingSystem.getBuildingAt(this.currentWorkTask.position);
+
+    if (!building || building.constructionProgress >= 100) {
+      // Building complete or removed
+      this.finishWorkTask();
+      return;
+    }
+
+    // Work on building every second
+    if (this.activityTimer >= 1000) {
+      this.activityTimer = 0;
+
+      // Work speed affected by traits
+      const workSpeed = this.traitEffects.workSpeedMult ?? 1.0;
+      this.buildingSystem.workOnBuilding(building, workSpeed);
+
+      // Building work is tiring
+      this.needs.hunger = Math.max(0, this.needs.hunger - 2);
+      this.needs.rest = Math.max(0, this.needs.rest - 1);
+
+      // Check if building is now complete
+      if (building.constructionProgress >= 100) {
+        console.log(`${this.nickname} finished building ${building.data.name}!`);
+        this.finishWorkTask();
+      }
+    }
+  }
+
+  private finishWorkTask(): void {
+    this.currentWorkTask = null;
+    this.behavior = BehaviorState.Idle;
+    this.idleTimer = 0;
+    // WorkSystem will clear its assignment when it sees we're idle
   }
 
   // ========== Predator/Prey Behaviors ==========
@@ -1222,6 +1373,33 @@ export class Pinata extends Phaser.GameObjects.Container {
         this.activityTimer = 0;
         break;
 
+      case BehaviorState.GoingToWork:
+        // Arrived at work task location - start working
+        if (this.currentWorkTask) {
+          this.activityTimer = 0;
+          if (this.currentWorkTask.type === 'farm') {
+            this.behavior = BehaviorState.Farming;
+          } else if (this.currentWorkTask.type === 'build') {
+            this.behavior = BehaviorState.Building;
+          } else if (this.currentWorkTask.type === 'gather') {
+            // Gathering uses existing behavior
+            const taskData = this.currentWorkTask.data as { resourceId: number };
+            const resource = this.resourceManager?.findResourceById(taskData.resourceId);
+            if (resource && resource.isAvailable()) {
+              this.targetResource = resource;
+              this.behavior = BehaviorState.PickingUpResource;
+            } else {
+              this.finishWorkTask();
+            }
+          } else {
+            this.finishWorkTask();
+          }
+        } else {
+          this.behavior = BehaviorState.Idle;
+          this.idleTimer = 0;
+        }
+        break;
+
       case BehaviorState.Wandering:
       case BehaviorState.Moving:
       default:
@@ -1319,6 +1497,15 @@ export class Pinata extends Phaser.GameObjects.Container {
         break;
       case BehaviorState.Dead:
         icon = '💀';
+        break;
+      case BehaviorState.GoingToWork:
+        icon = '🚶';
+        break;
+      case BehaviorState.Farming:
+        icon = '🌾';
+        break;
+      case BehaviorState.Building:
+        icon = '🔨';
         break;
       default:
         // Show warning icon if a need is critical

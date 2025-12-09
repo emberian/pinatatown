@@ -143,6 +143,10 @@ export class GameScene extends Phaser.Scene {
       this.selectedCommand = command;
     });
 
+    this.gameUI.onBuildingChange((buildingType) => {
+      this.buildingSystem.setSelectedBuildingType(buildingType);
+    });
+
     // Create some starting zones for demo
     this.createStartingZones();
 
@@ -233,13 +237,15 @@ export class GameScene extends Phaser.Scene {
       pinata.setPinataList(this.pinatas);
       pinata.setRelationshipSystem(this.relationshipSystem);
       pinata.setSeasonSystem(this.seasonSystem);
+      pinata.setBuildingSystem(this.buildingSystem);
+      pinata.setFarmingSystem(this.farmingSystem);
     }
 
     // Welcome notification
     this.notificationSystem.special('Welcome to Piñata Town!', '🎉');
 
     console.log('Piñata Town loaded!');
-    console.log('Controls: [Z] Zone | [T] Terraform | [C] Command | [L] Log | [Space] Pause');
+    console.log('Controls: [Z] Zone | [T] Terraform | [B] Build | [C] Command | [L] Log | [Space] Pause');
     console.log('Seasons cycle every 3 minutes. Prepare for winter!');
   }
 
@@ -404,6 +410,19 @@ export class GameScene extends Phaser.Scene {
     } else if (this.gameUI.getMode() === UIMode.Command && this.selectedCommand && this.selectedPinata) {
       // Execute command on selected piñata
       this.executeCommand(gridPos);
+    } else if (this.gameUI.getMode() === UIMode.Build) {
+      // Place building blueprint
+      const buildingType = this.buildingSystem.getSelectedBuildingType();
+      if (buildingType) {
+        const building = this.buildingSystem.placeBlueprint(gridPos, buildingType);
+        if (building) {
+          this.notificationSystem.info(`${building.data.name} blueprint placed`, building.data.icon);
+        } else if (!this.buildingSystem.canPlace(gridPos, buildingType)) {
+          this.notificationSystem.warning('Cannot place building here');
+        } else if (!this.buildingSystem.canAfford(buildingType)) {
+          this.notificationSystem.warning('Not enough resources!');
+        }
+      }
     }
     // Normal mode clicks are handled by piñata interactive zones
   }
@@ -528,6 +547,16 @@ export class GameScene extends Phaser.Scene {
       if (this.gameUI.getMode() === UIMode.Normal) {
         this.selectPinata(pinata);
       }
+    });
+
+    // Connect newly created piñatas to all systems
+    EventBus.on(GameEvents.PINATA_CREATED, (...args: unknown[]) => {
+      const pinata = args[0] as Pinata;
+      pinata.setTimeSystem(this.timeSystem);
+      pinata.setRelationshipSystem(this.relationshipSystem);
+      pinata.setSeasonSystem(this.seasonSystem);
+      pinata.setBuildingSystem(this.buildingSystem);
+      pinata.setFarmingSystem(this.farmingSystem);
     });
   }
 
@@ -685,8 +714,18 @@ export class GameScene extends Phaser.Scene {
     if (tile) {
       const { x, y } = gridToScreen(gridPos.x, gridPos.y);
 
-      // Different color in zone mode
-      const color = this.gameUI.getMode() === UIMode.ZoneDesignate ? 0x00ff00 : 0xffffff;
+      // Different color based on mode
+      let color = 0xffffff;
+      if (this.gameUI.getMode() === UIMode.ZoneDesignate) {
+        color = 0x00ff00;
+      } else if (this.gameUI.getMode() === UIMode.Build) {
+        const buildingType = this.buildingSystem.getSelectedBuildingType();
+        if (buildingType) {
+          const canPlace = this.buildingSystem.canPlace(gridPos, buildingType);
+          const canAfford = this.buildingSystem.canAfford(buildingType);
+          color = canPlace && canAfford ? 0x00ff00 : 0xff0000;
+        }
+      }
 
       // Draw diamond outline
       this.hoverTileIndicator.lineStyle(2, color, 0.6);

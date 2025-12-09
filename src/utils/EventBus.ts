@@ -54,6 +54,7 @@ export const GameEvents = {
   PINATA_HELPED: 'pinata:helped',
   PINATA_ROMANCE_STARTED: 'pinata:romanceStarted',
   PINATA_BORN: 'pinata:born',
+  PINATA_CREATED: 'pinata:created', // New piñata added to world, needs system connections
   SOUR_PINATA_SPAWNED: 'pinata:sourSpawned',
   SOUR_PINATA_CURED: 'pinata:sourCured',
   RELATIONSHIP_CHANGED: 'relationship:changed',
